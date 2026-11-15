@@ -1,0 +1,10 @@
+**/node_modules
+.git
+docs
+infra
+test
+**/test
+**/.env
+**/.env.*
+!**/.env.example
+.devbox

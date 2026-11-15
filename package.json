@@ -1,0 +1,21 @@
+{
+  "name": "cloud-security-core-services",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Correlation Engine, Incident Management Service and Event Store for the S25 Cloud Security Monitoring pipeline",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "packages/common",
+    "packages/tpc",
+    "services/event-store",
+    "services/incident-management",
+    "services/correlation-engine"
+  ],
+  "scripts": {
+    "test": "npm test --workspaces --if-present",
+    "test:integration": "INTEGRATION=1 node --test \"test/e2e/**/*.test.js\""
+  }
+}
