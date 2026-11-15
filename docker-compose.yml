@@ -1,6 +1,10 @@
 # Local development stack for the core services.
 # Infra: Kafka (KRaft, single node), topic-init, Postgres, DynamoDB Local, S3 mock.
-# The three services are added in Task 9.
+# Services: event-store, incident-management, correlation-engine (built from this workspace).
+#
+# 3PC demo toggles (see scripts/demo-3pc.sh):
+#   ES_TPC_FORCE_VOTE=no                    event-store votes no on every transaction
+#   IM_TPC_FAULT=crash-after-precommit      incident-management exits after all preCommit acks
 name: cs-core
 
 services:
@@ -88,3 +92,107 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 10
+
+  event-store:
+    build:
+      context: .
+      dockerfile: services/event-store/Dockerfile
+    image: event-store:dev
+    ports:
+      - "8081:8081"
+    environment:
+      PORT: 8081
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      KAFKA_BROKERS: kafka:9092
+      AWS_REGION: ap-south-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      DYNAMODB_ENDPOINT: http://dynamodb-local:8000
+      S3_ENDPOINT: http://s3mock:9090
+      RAW_BUCKET: cs-raw-events
+      TABLE_PREFIX: cs-
+      TPC_TIMEOUT_MS: 10000
+      TPC_FORCE_VOTE: ${ES_TPC_FORCE_VOTE:-}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+      dynamodb-local:
+        condition: service_healthy
+      s3mock:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8081/ready || exit 1"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 20
+
+  incident-management:
+    build:
+      context: .
+      dockerfile: services/incident-management/Dockerfile
+    image: incident-management:dev
+    ports:
+      - "8082:8082"
+      - "50051:50051"
+    environment:
+      PORT: 8082
+      GRPC_PORT: 50051
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgres://incidents:incidents@postgres:5432/incidents
+      DATABASE_SSL: "false"
+      KAFKA_BROKERS: kafka:9092
+      EVENT_STORE_URL: http://event-store:8081
+      INCIDENT_TOPIC: incident-updates
+      TPC_TIMEOUT_MS: 3000
+      TPC_PARTICIPANT_TIMEOUT_MS: 10000
+      TPC_FAULT: ${IM_TPC_FAULT:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+      event-store:
+        condition: service_healthy
+    # No automatic restart: the 3PC crash demo shows the exit, then restarts it
+    # by hand without the fault so recover() finishes the transaction.
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8082/ready || exit 1"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 20
+
+  correlation-engine:
+    build:
+      context: .
+      dockerfile: services/correlation-engine/Dockerfile
+    image: correlation-engine:dev
+    ports:
+      - "8083:8083"
+    environment:
+      PORT: 8083
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      KAFKA_BROKERS: kafka:9092
+      INCIDENT_GRPC_ADDR: incident-management:50051
+      EVENT_STORE_URL: http://event-store:8081
+      CORRELATION_WINDOW_MS: 900000
+      ESCALATE_ALERT_COUNT: 3
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+      event-store:
+        condition: service_healthy
+      incident-management:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8083/ready || exit 1"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 20
