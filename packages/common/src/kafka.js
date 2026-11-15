@@ -1,4 +1,4 @@
-import { Kafka, logLevel } from 'kafkajs';
+import { Kafka, Partitioners, logLevel } from 'kafkajs';
 
 // Connection settings match the group repo exactly:
 // KAFKA_BROKERS (comma-separated), KAFKA_SSL ("true" enables TLS),
@@ -46,7 +46,13 @@ export function createKafka({ clientId, logger, env = process.env }) {
 
 // Producers follow the group convention: idempotent, acks=-1, no auto-created topics.
 export function createProducer(kafka) {
-  return kafka.producer({ idempotent: true, maxInFlightRequests: 1, allowAutoTopicCreation: false });
+  return kafka.producer({
+    idempotent: true,
+    maxInFlightRequests: 1,
+    allowAutoTopicCreation: false,
+    // kafkajs 2.x default (Java-compatible murmur2); set explicitly to silence its warning.
+    createPartitioner: Partitioners.DefaultPartitioner,
+  });
 }
 
 export async function sendJson(producer, topic, key, value) {
