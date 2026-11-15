@@ -1,0 +1,14 @@
+{
+  "name": "detection-rules",
+  "version": "1.0.0",
+  "description": "Kafka consumer for detecting security events",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "KAFKA_BROKERS=localhost:9092 node --test"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.9",
+    "kafkajs": "^2.2.4"
+  }
+}

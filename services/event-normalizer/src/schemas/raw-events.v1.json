@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "raw-events.v1.json",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "eventId",
+    "receivedAt",
+    "eventTime",
+    "source",
+    "format",
+    "payload",
+    "ingestedBy"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "$ref": "common.v1.json#/definitions/schemaVersion"
+    },
+    "eventId": {
+      "$ref": "common.v1.json#/definitions/uuid"
+    },
+    "receivedAt": {
+      "$ref": "common.v1.json#/definitions/timestamp"
+    },
+    "eventTime": {
+      "$ref": "common.v1.json#/definitions/timestampOrNull"
+    },
+    "source": {
+      "$ref": "common.v1.json#/definitions/logSource"
+    },
+    "format": {
+      "enum": ["json", "text"]
+    },
+    "payload": {
+      "type": ["object", "string"]
+    },
+    "ingestedBy": {
+      "$ref": "common.v1.json#/definitions/service"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "format": { "const": "json" }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": { "type": "object" }
+        }
+      },
+      "else": {
+        "properties": {
+          "payload": { "type": "string" }
+        }
+      }
+    }
+  ]
+}

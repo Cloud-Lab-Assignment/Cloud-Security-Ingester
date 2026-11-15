@@ -1,0 +1,145 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "normalized-events.v1.json",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "eventId",
+    "eventTime",
+    "receivedAt",
+    "normalizedAt",
+    "entityKey",
+    "category",
+    "action",
+    "outcome",
+    "actor",
+    "network",
+    "target",
+    "source",
+    "message",
+    "attributes",
+    "origin",
+    "normalizedBy"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "$ref": "common.v1.json#/definitions/schemaVersion"
+    },
+    "eventId": {
+      "$ref": "common.v1.json#/definitions/uuid"
+    },
+    "eventTime": {
+      "$ref": "common.v1.json#/definitions/timestamp"
+    },
+    "receivedAt": {
+      "$ref": "common.v1.json#/definitions/timestamp"
+    },
+    "normalizedAt": {
+      "$ref": "common.v1.json#/definitions/timestamp"
+    },
+    "entityKey": {
+      "type": "string",
+      "minLength": 1
+    },
+    "category": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "examples": [
+        "authentication",
+        "network",
+        "api_call",
+        "configuration",
+        "storage",
+        "compute",
+        "system",
+        "other"
+      ]
+    },
+    "action": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "outcome": {
+      "enum": ["success", "failure", "unknown"]
+    },
+    "actor": {
+      "type": "object",
+      "required": ["userId", "userName", "userType"],
+      "properties": {
+        "userId": {
+          "$ref": "common.v1.json#/definitions/stringOrNull"
+        },
+        "userName": {
+          "$ref": "common.v1.json#/definitions/stringOrNull"
+        },
+        "userType": {
+          "enum": ["human", "service", "unknown"]
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "required": ["srcIp", "srcPort", "dstIp", "dstPort", "protocol"],
+      "properties": {
+        "srcIp": {
+          "$ref": "common.v1.json#/definitions/stringOrNull"
+        },
+        "srcPort": {
+          "$ref": "common.v1.json#/definitions/integerOrNull"
+        },
+        "dstIp": {
+          "$ref": "common.v1.json#/definitions/stringOrNull"
+        },
+        "dstPort": {
+          "$ref": "common.v1.json#/definitions/integerOrNull"
+        },
+        "protocol": {
+          "$ref": "common.v1.json#/definitions/stringOrNull"
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "required": ["resourceType", "resourceId"],
+      "properties": {
+        "resourceType": {
+          "$ref": "common.v1.json#/definitions/stringOrNull"
+        },
+        "resourceId": {
+          "$ref": "common.v1.json#/definitions/stringOrNull"
+        }
+      }
+    },
+    "source": {
+      "$ref": "common.v1.json#/definitions/logSource"
+    },
+    "message": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "attributes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": ["string", "number", "boolean", "null"]
+      }
+    },
+    "origin": {
+      "type": "object",
+      "required": ["topic", "partition", "offset"],
+      "properties": {
+        "topic": {
+          "type": "string"
+        },
+        "partition": {
+          "type": "integer"
+        },
+        "offset": {
+          "type": "integer"
+        }
+      }
+    },
+    "normalizedBy": {
+      "$ref": "common.v1.json#/definitions/service"
+    }
+  }
+}
