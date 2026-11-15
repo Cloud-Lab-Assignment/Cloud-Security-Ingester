@@ -1,0 +1,274 @@
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { CoordinatorCrash } from '@core/tpc';
+import { migrate } from '../src/migrate.js';
+import { createIncidentRepo, VersionConflict, TransactionPending } from '../src/incidents.js';
+import {
+  createIncidentService,
+  createPgCoordinatorLog,
+  applyDecision,
+  IncidentAborted,
+  StaleVersion,
+} from '../src/tpc-wiring.js';
+import { createTestDatabase, fakeEventStore, fakePublisher, silentLogger, candidate } from './helpers.js';
+
+const skip = !process.env.INTEGRATION;
+const config = {
+  tpcTimeoutMs: 500,
+  tpcParticipantTimeoutMs: 10_000,
+  correlationWindowMs: 900_000,
+};
+
+let db;
+let repo;
+
+function service(over = {}) {
+  const eventStore = over.eventStore ?? fakeEventStore();
+  const publisher = over.publisher ?? fakePublisher();
+  const svc = createIncidentService({
+    pool: db.pool,
+    repo,
+    eventStore,
+    publisher,
+    config: { ...config, ...(over.config ?? {}) },
+    logger: silentLogger,
+    onCrash: over.onCrash,
+  });
+  return { svc, eventStore, publisher };
+}
+
+before(async () => {
+  if (skip) return;
+  db = await createTestDatabase();
+  await migrate(db.pool);
+  repo = createIncidentRepo({ pool: db.pool, correlationWindowMs: config.correlationWindowMs });
+});
+
+after(async () => {
+  if (db) await db.drop();
+});
+
+test('migrate is idempotent', { skip }, async () => {
+  assert.deepEqual(await migrate(db.pool), []);
+  const { rows } = await db.pool.query('SELECT name FROM schema_migrations');
+  assert.deepEqual(rows.map((r) => r.name), ['001_init.sql']);
+});
+
+test('upsertIncident commits to postgres and event-store and publishes incident.created', { skip }, async () => {
+  const { svc, eventStore, publisher } = service();
+  const c = candidate();
+  const res = await svc.upsertIncident(c);
+  assert.equal(res.outcome, 'created');
+  assert.equal(res.incident.version, 1);
+  assert.equal(res.incident.status, 'open');
+  assert.deepEqual(res.incident.alertIds, c.alertIds);
+
+  const stored = await repo.getIncident(res.incident.incidentId);
+  assert.equal(stored.correlationId, c.correlationId);
+  assert.deepEqual(stored.enrichment, c.enrichment);
+
+  assert.equal(eventStore.applied.length, 1);
+  assert.equal(eventStore.applied[0].correlationId, c.correlationId);
+  assert.equal(eventStore.applied[0].version, 1);
+  assert.equal(eventStore.applied[0].decision.kind, 'create');
+
+  assert.equal(publisher.published.length, 1);
+  assert.equal(publisher.published[0].type, 'incident.created');
+  assert.equal(publisher.published[0].incident.incidentId, res.incident.incidentId);
+
+  const [tx] = await createPgCoordinatorLog(db.pool).list({ correlationId: c.correlationId });
+  assert.equal(tx.state, 'COMMITTED');
+
+  const history = await repo.getHistory(res.incident.incidentId);
+  assert.equal(history.length, 1);
+  assert.equal(history[0].txId, tx.txId);
+});
+
+test('second candidate with a new alert updates and publishes incident.updated', { skip }, async () => {
+  const { svc, eventStore, publisher } = service();
+  const c1 = candidate();
+  const first = await svc.upsertIncident(c1);
+  const newAlert = `${c1.alertIds[0]}-2`;
+  const res = await svc.upsertIncident({ ...c1, alertIds: [...c1.alertIds, newAlert], severity: 'critical' });
+  assert.equal(res.outcome, 'updated');
+  assert.equal(res.incident.version, 2);
+  assert.equal(res.incident.alertCount, 2);
+  assert.equal(res.incident.severity, 'critical');
+  assert.equal(res.incident.incidentId, first.incident.incidentId);
+  assert.deepEqual(eventStore.applied.map((p) => p.version), [1, 2]);
+  assert.deepEqual(eventStore.applied[1].decision.newAlertIds, [newAlert]);
+  assert.deepEqual(publisher.published.map((p) => p.type), ['incident.created', 'incident.updated']);
+});
+
+test('redelivered candidate with only known alerts is a noop without 3PC', { skip }, async () => {
+  const { svc, eventStore } = service();
+  const c = candidate();
+  await svc.upsertIncident(c);
+  const res = await svc.upsertIncident(c);
+  assert.equal(res.outcome, 'noop');
+  assert.equal(res.incident.version, 1);
+  assert.equal(eventStore.applied.length, 1);
+});
+
+test('event-store votes no → no row, IncidentAborted("vote_no")', { skip }, async () => {
+  const { svc, eventStore, publisher } = service({ eventStore: fakeEventStore({ vote: 'no' }) });
+  const c = candidate();
+  await assert.rejects(svc.upsertIncident(c), (err) => err instanceof IncidentAborted && err.reason === 'vote_no');
+  const { rowCount } = await db.pool.query('SELECT 1 FROM incidents WHERE correlation_id = $1', [c.correlationId]);
+  assert.equal(rowCount, 0);
+  assert.equal(eventStore.applied.length, 0);
+  assert.equal(publisher.published.length, 0);
+  const [tx] = await createPgCoordinatorLog(db.pool).list({ correlationId: c.correlationId });
+  assert.equal(tx.state, 'ABORTED');
+  assert.equal(tx.reason, 'vote_no');
+  const local = await db.pool.query('SELECT state FROM tpc_participant WHERE tx_id = $1', [tx.txId]);
+  assert.equal(local.rows[0].state, 'ABORTED');
+});
+
+test('TPC_FAULT crash then recover() commits and publishes', { skip }, async () => {
+  const eventStore = fakeEventStore();
+  let crashed = null;
+  const { svc } = service({
+    eventStore,
+    config: { tpcFault: 'crash-after-precommit' },
+    onCrash: async (err) => {
+      crashed = err;
+    },
+  });
+  const c = candidate();
+  await assert.rejects(svc.upsertIncident(c), CoordinatorCrash);
+  assert.ok(crashed instanceof CoordinatorCrash);
+  let { rowCount } = await db.pool.query('SELECT 1 FROM incidents WHERE correlation_id = $1', [c.correlationId]);
+  assert.equal(rowCount, 0, 'nothing applied before doCommit');
+
+  // "Restart": a new coordinator without the fault over the same database.
+  const publisher = fakePublisher();
+  const { svc: restarted } = service({ eventStore, publisher });
+  const recovered = await restarted.recover();
+  assert.equal(recovered.length, 1);
+  ({ rowCount } = await db.pool.query('SELECT 1 FROM incidents WHERE correlation_id = $1', [c.correlationId]));
+  assert.equal(rowCount, 1);
+  assert.equal(eventStore.applied.length, 1);
+  assert.deepEqual(publisher.published.map((p) => p.type), ['incident.created']);
+  const [tx] = await createPgCoordinatorLog(db.pool).list({ correlationId: c.correlationId });
+  assert.equal(tx.state, 'COMMITTED');
+});
+
+test('concurrent upsert for same correlationId votes no', { skip }, async () => {
+  const { svc, eventStore } = service();
+  const c = candidate();
+  // Hold transaction A in PRECOMMITTED on the local participant.
+  const payloadA = {
+    correlationId: c.correlationId,
+    kind: 'create',
+    version: 1,
+    incident: { incidentId: '00000000-0000-4000-8000-000000000001', correlationId: c.correlationId },
+    newAlertIds: [],
+  };
+  assert.equal(await svc.participant.canCommit('tx-A-' + c.correlationId, payloadA), 'yes');
+  await svc.participant.preCommit('tx-A-' + c.correlationId);
+
+  await assert.rejects(svc.upsertIncident(c), (err) => err instanceof IncidentAborted && err.reason === 'vote_no');
+  assert.equal(eventStore.applied.length, 0);
+  await svc.participant.abort('tx-A-' + c.correlationId);
+});
+
+test('stale apply version rejected', { skip }, async () => {
+  const { svc } = service();
+  const c = candidate();
+  const { incident } = await svc.upsertIncident(c);
+  const staleUpdate = {
+    txId: `stale-${c.correlationId}`,
+    kind: 'update',
+    version: 5, // expects the row at version 4, but it is at 1
+    incident: { ...incident, alertCount: 99 },
+    newAlertIds: ['x'],
+  };
+  await assert.rejects(applyDecision(db.pool, staleUpdate), StaleVersion);
+  const after = await repo.getIncident(incident.incidentId);
+  assert.equal(after.version, 1);
+  assert.equal(after.alertCount, 1);
+  // ...and the participant votes no on such a payload before it ever gets that far.
+  assert.equal(
+    await svc.participant.canCommit(`stale2-${c.correlationId}`, { ...staleUpdate, correlationId: incident.correlationId }),
+    'no',
+  );
+});
+
+test('applyDecision is idempotent per txId', { skip }, async () => {
+  const { svc } = service();
+  const c = candidate();
+  const { incident, txId } = await svc.upsertIncident(c);
+  await applyDecision(db.pool, { txId, kind: 'create', version: 1, incident, newAlertIds: incident.alertIds });
+  const { rowCount } = await db.pool.query('SELECT 1 FROM incident_history WHERE tx_id = $1', [txId]);
+  assert.equal(rowCount, 1);
+});
+
+test('findTarget falls back to open incident for same entity inside window', { skip }, async () => {
+  const { svc } = service();
+  const c = candidate();
+  const { incident } = await svc.upsertIncident(c);
+
+  const inside = await repo.findTarget({ ...c, correlationId: 'cor-other', firstSeen: '2026-11-16T09:10:00.000Z' });
+  assert.equal(inside.existing?.incidentId, incident.incidentId);
+  assert.ok(inside.knownAlertIds.has(c.alertIds[0]));
+
+  const outside = await repo.findTarget({ ...c, correlationId: 'cor-other', firstSeen: '2026-11-16T09:20:00.001Z' });
+  assert.equal(outside.existing, null);
+
+  // A rebalanced engine's candidate merges into the stored incident and keeps its correlationId.
+  const res = await svc.upsertIncident({ ...c, correlationId: 'cor-rebalanced', alertIds: ['late-alert'] });
+  assert.equal(res.outcome, 'updated');
+  assert.equal(res.incident.correlationId, c.correlationId);
+
+  await repo.updateStatus(incident.incidentId, { status: 'resolved', version: res.incident.version });
+  const resolved = await repo.findTarget({ ...c, correlationId: 'cor-other', firstSeen: '2026-11-16T09:10:00.000Z' });
+  assert.equal(resolved.existing, null, 'resolved incidents are not reopened by fallback');
+});
+
+test('updateStatus bumps version and records history', { skip }, async () => {
+  const { svc } = service();
+  const { incident } = await svc.upsertIncident(candidate());
+  const updated = await repo.updateStatus(incident.incidentId, { status: 'investigating', version: 1, actor: 'alice', note: 'looking' });
+  assert.equal(updated.status, 'investigating');
+  assert.equal(updated.version, 2);
+  const history = await repo.getHistory(incident.incidentId);
+  assert.deepEqual(history.at(-1).change, { kind: 'status', from: 'open', to: 'investigating', note: 'looking' });
+  assert.equal(history.at(-1).actor, 'alice');
+});
+
+test('updateStatus stale version throws VersionConflict', { skip }, async () => {
+  const { svc } = service();
+  const { incident } = await svc.upsertIncident(candidate());
+  await repo.updateStatus(incident.incidentId, { status: 'investigating', version: 1 });
+  await assert.rejects(repo.updateStatus(incident.incidentId, { status: 'resolved', version: 1 }), VersionConflict);
+});
+
+test('updateStatus refuses while a 3PC transaction is pending', { skip }, async () => {
+  const { svc } = service();
+  const c = candidate();
+  const { incident } = await svc.upsertIncident(c);
+  const txId = `pending-${c.correlationId}`;
+  await svc.participant.canCommit(txId, {
+    correlationId: c.correlationId,
+    kind: 'update',
+    version: 2,
+    incident: { ...incident, version: 2 },
+    newAlertIds: ['n'],
+  });
+  await assert.rejects(repo.updateStatus(incident.incidentId, { status: 'resolved', version: 1 }), TransactionPending);
+  await svc.participant.abort(txId);
+  const ok = await repo.updateStatus(incident.incidentId, { status: 'resolved', version: 1 });
+  assert.equal(ok.status, 'resolved');
+});
+
+test('listIncidents filters by status and severity', { skip }, async () => {
+  const { svc } = service();
+  const a = await svc.upsertIncident(candidate({ severity: 'low' }));
+  await repo.updateStatus(a.incident.incidentId, { status: 'false_positive', version: 1 });
+  const fp = await repo.listIncidents({ status: 'false_positive' });
+  assert.ok(fp.some((i) => i.incidentId === a.incident.incidentId));
+  assert.ok(fp.every((i) => i.status === 'false_positive'));
+  const low = await repo.listIncidents({ severity: 'low', limit: 500 });
+  assert.ok(low.every((i) => i.severity === 'low'));
+});
