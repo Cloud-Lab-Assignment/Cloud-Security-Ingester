@@ -13,3 +13,4 @@ The group repo is https://github.com/Cloud-Lab-Assignment/Cloud-Security-Ingeste
 
 1. `docs/project-brief.md`: the spec. It covers the assignment, who owns what, and the upstream Kafka contracts.
 2. `docs/superpowers/plans/2026-11-16-core-services.md`: the implementation plan. Follow its **Working Rules**. In short: no installs beyond the approved list, no `terraform plan`/`apply`, no actions on the group repo, and push only when asked.
+3. **Current work:** `docs/review-fixes-2026-11-16.md`. Review findings on the built services, ordered P0 → P2, with their own working rules. Work through it next.
