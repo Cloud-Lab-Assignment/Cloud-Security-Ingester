@@ -1,6 +1,6 @@
 # Core services handoff: event-store, incident-management, correlation-engine
 
-> **Draft:** ports/env are final; image names TBD with Ansh.
+> Ports, env vars, topics and AWS resources are final. Image names and the registry are still to be agreed with Ansh.
 
 For **Ansh** (CI/CD, K8s, GitOps) and **Neeharika** (Kafka/infra). Owner of these services: Rishit.
 
@@ -52,7 +52,7 @@ docker build -f services/event-store/Dockerfile -t event-store:<tag> .
 | `RAW_BUCKET` | `cs-raw-events` | **yes** | Terraform output `raw_bucket_name`. |
 | `TABLE_PREFIX` | `cs-` | no | Must match Terraform `name_prefix`. |
 | `DYNAMODB_ENDPOINT` | unset | **leave unset** | Local only (DynamoDB Local). When set, the service creates its tables itself. |
-| `S3_ENDPOINT` | unset | **leave unset** | Local only (MinIO). |
+| `S3_ENDPOINT` | unset | **leave unset** | Local only (S3 mock). When set, path-style addressing is used. |
 | `TPC_TIMEOUT_MS` | `10000` | no | Participant timeout before UNCERTAIN self-aborts / PRECOMMITTED self-commits. |
 | `TPC_FORCE_VOTE` | unset | **leave unset** | Demo only (`no` forces a "no" vote). |
 | `LOG_LEVEL` | `info` | no | |
@@ -79,7 +79,10 @@ The image bakes in the AWS RDS CA bundle at `/etc/ssl/rds/global-bundle.pem`.
 
 **Kafka:** produces `incident-updates` (key `incidentId`). Consumes nothing.
 
-**REST API:** `GET /incidents?status=&severity=&limit=`, `GET /incidents/:id`, `PATCH /incidents/:id` (`{status, version, actor?, note?}`, 409 on stale version), `GET /tpc/transactions?limit=&correlationId=`.
+**REST API:**
+- `GET /incidents?status=&severity=&entityKey=&limit=`, `GET /incidents/:id`, `GET /incidents/:id/history`
+- `PATCH /incidents/:id` with `{status, version, actor?, note?}`. Returns 409 `{error:"version_conflict", currentVersion}` on a stale version, and 409 `{error:"transaction_pending"}` while a 3PC transaction for that incident is in flight (retry shortly).
+- `GET /tpc/transactions?limit=&correlationId=`: the coordinator log, newest first (used in the 3PC demo).
 
 **Env vars:**
 
@@ -229,6 +232,94 @@ Inputs: `region` (default `ap-south-1`), `name_prefix` (default `cs-`), `vpc_id`
 
 (Add the namespace, e.g. `event-store.<ns>.svc.cluster.local`, if the services run in different namespaces.)
 
+## Local run (Docker Compose)
+
+```sh
+docker compose up -d --build     # kafka, topic-init, postgres, dynamodb-local, s3mock + the 3 services
+npm test                         # unit tests in every workspace
+INTEGRATION=1 npm test -w event-store -w incident-management   # storage/3PC tests against the compose infra
+npm run test:integration         # end-to-end: raw/normalized events + alerts -> incident, S3, DynamoDB, incident-updates
+scripts/demo-3pc.sh              # the 3PC demo below
+```
+
+The local S3 is `adobe/s3mock:5.2.3` (the MinIO image originally planned is no longer published). It is host port 9000 and `http://s3mock:9090` inside compose. In AWS the real S3 bucket from Terraform is used, with the same code.
+
 ## 3PC demo
 
-_Placeholder: filled in after the end-to-end run on Docker Compose (normal commit, event-store "no" vote → abort, coordinator crash after pre-commit → `recover()` commits). The fault cases are demoed on Compose, not through GitOps._
+Run on Docker Compose with `scripts/demo-3pc.sh`. **Demo the fault cases on Compose, not through GitOps:** `TPC_FORCE_VOTE` and `TPC_FAULT` must never be set in the cluster.
+
+1. **Normal commit:** an alert creates an incident; the coordinator log shows one COMMITTED transaction, and the Event Store holds the matching correlation version.
+2. **Event Store votes no** (`ES_TPC_FORCE_VOTE=no`): every attempt is ABORTED with `vote_no`, the Postgres participant aborts too, and no incident exists. The correlation-engine keeps retrying the alert. Once the Event Store votes normally again, the retry commits.
+3. **Coordinator crash after pre-commit** (`IM_TPC_FAULT=crash-after-precommit`): incident-management exits after both participants acknowledged `preCommit`. The log is left PRECOMMITTED, with no incident row. On restart without the fault, `recover()` re-sends `preCommit` and commits on both sides. If a participant had already self-committed on its own timeout (the 3PC property 2PC lacks), that counts as an acknowledgement.
+
+**Demo notes:**
+- Upstream has one detection rule (`RULE-AUTH-001`) and suppresses the same entity for 60 s. Live escalation to `critical` (3 alerts by default) therefore needs 3 alerts more than 60 s apart for one entity. The script and the e2e test publish alerts directly to `security-alerts` instead.
+- Status changes (`PATCH`) are plain local Postgres updates, not 3PC; only correlation decisions use 3PC.
+
+Output of one run (15 Nov 2026, 21:24 UTC):
+
+```text
+==> Scenario 1: normal commit
+    sent alert RULE-AUTH-001|203.0.113.79|c189ff7d…
+{
+  "incidentId": "21467dd4-c96e-42b8-b0b4-4ab429c36ae6",
+  "correlationId": "cor-727adc0e735144c6e757e148",
+  "status": "open",
+  "severity": "high",
+  "alertCount": 1,
+  "version": 1
+}
+    coordinator log for cor-727adc0e735144c6e757e148:
+{"txId":"6ccdf137","state":"COMMITTED","reason":null,"kind":"create","version":1,"correlationId":"cor-727adc0e735144c6e757e148"}
+    event-store correlation history:
+{"version":1,"kind":"create","txId":"6ccdf137","recordedAt":"2026-11-15T21:24:08.691Z"}
+
+==> Scenario 2: the Event Store votes no
+    restarting event-store with TPC_FORCE_VOTE=no
+    sent alert RULE-AUTH-001|203.0.113.88|04e46412…
+    incidents for 203.0.113.88 (expect none):
+[]
+    latest coordinator log entries (expect ABORTED vote_no; the correlation engine keeps retrying):
+{"txId":"f380df98","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-1f82c6cbe2dbe93bd1f44c73"}
+{"txId":"a454144e","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-1f82c6cbe2dbe93bd1f44c73"}
+{"txId":"1d12f6cb","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-1f82c6cbe2dbe93bd1f44c73"}
+    postgres participant rows for those transactions are ABORTED too:
+1d12f6cb|ABORTED
+a454144e|ABORTED
+f380df98|ABORTED
+    restoring event-store (votes normally); the engine's retry now commits
+{
+  "incidentId": "c5d43336-e1ec-49a0-8d4c-27a1f802bf8a",
+  "correlationId": "cor-1f82c6cbe2dbe93bd1f44c73",
+  "status": "open",
+  "severity": "high",
+  "alertCount": 1,
+  "version": 1
+}
+{"txId":"7eb5d50a","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-1f82c6cbe2dbe93bd1f44c73"}
+{"txId":"d4096bad","state":"COMMITTED","reason":null,"kind":"create","version":1,"correlationId":"cor-1f82c6cbe2dbe93bd1f44c73"}
+
+==> Scenario 3: the coordinator crashes after every participant pre-committed
+    restarting incident-management with TPC_FAULT=crash-after-precommit
+    sent alert RULE-AUTH-001|203.0.113.84|9ffbec42…
+    incident-management container: exited 1
+    "msg":"injected coordinator crash after preCommit"
+    coordinator log in postgres (expect PRECOMMITTED) and no incident row yet:
+084c8a3f|PRECOMMITTED
+0 incident row(s) for 203.0.113.84
+    restarting incident-management without the fault: recover() finishes the transaction
+    "recovered":["084c8a3f-d763-4415-a945-d295541cfbe1"]
+{
+  "incidentId": "31fbd49c-d547-4634-bf01-d738d3308eb5",
+  "correlationId": "cor-29e5418af3ee039081c73adb",
+  "status": "open",
+  "severity": "high",
+  "alertCount": 1,
+  "version": 1
+}
+{"txId":"084c8a3f","state":"COMMITTED","reason":null,"kind":"create","version":1,"correlationId":"cor-29e5418af3ee039081c73adb"}
+    event-store correlation history:
+{"version":1,"kind":"create","txId":"084c8a3f"}
+
+==> Done. The stack is back to normal (no forced votes, no faults).
+```
