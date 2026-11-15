@@ -15,6 +15,7 @@
     "@core/tpc": "^1.0.0",
     "@grpc/grpc-js": "^1.14.7",
     "@grpc/proto-loader": "^0.8.1",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "prom-client": "^15.1.3"
   }
 }

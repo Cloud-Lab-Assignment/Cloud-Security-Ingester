@@ -1,5 +1,5 @@
 # Local development stack for the core services.
-# Infra: Kafka (KRaft, single node), topic-init, Postgres, DynamoDB Local, S3-compatible object store.
+# Infra: Kafka (KRaft, single node), topic-init, Postgres, DynamoDB Local, S3 mock.
 # The three services are added in Task 9.
 name: cs-core
 
@@ -72,4 +72,19 @@ services:
       test: ["CMD-SHELL", "curl -s -o /dev/null http://localhost:8000 || exit 1"]
       interval: 5s
       timeout: 5s
+      retries: 10
+
+  # S3-compatible object store for local runs. The plan pinned MinIO, but its
+  # images are no longer published; Rishit chose adobe/s3mock instead.
+  # Host port 9000 keeps S3_ENDPOINT=http://localhost:9000 for code run on the host;
+  # inside the compose network use http://s3mock:9090.
+  s3mock:
+    image: adobe/s3mock:5.2.3
+    ports:
+      - "9000:9090"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9090"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
       retries: 10
