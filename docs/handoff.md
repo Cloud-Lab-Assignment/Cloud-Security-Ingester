@@ -122,6 +122,11 @@ The image bakes in the AWS RDS CA bundle at `/etc/ssl/rds/global-bundle.pem`.
 
 **Startup:** opens the HTTP port first (so `/health` answers and `/ready` returns **503**, not "connection refused"), then runs DB migrations, connects the Kafka producer, runs 3PC `recover()` (finishes or aborts in-flight transactions) and starts gRPC. `/ready` turns 200 only after all of that. Recovery then re-runs every 15 s, and a relay publishes the transactional outbox to `incident-updates` every second.
 
+**Held `incident-updates` messages (`outbox_held_rows`):** a 3PC message waits in the outbox until the coordinator logs its transaction COMMITTED. The gauge `outbox_held_rows` counts messages held for more than 5 minutes; it should be 0.
+- A held message whose transaction ended **ABORTED** (only possible after a timeout split) is marked `discarded` automatically and logged at error level; later messages of that incident then go out.
+- A message held because its transaction is still **PRECOMMITTED** is never expired: recovery (every 15 s) keeps retrying the participant that hasn't acknowledged, usually the event-store. Fix that participant and the message goes out by itself.
+- To inspect by hand: `SELECT o.id, o.incident_id, o.tx_id, c.state, o.created_at FROM outbox o LEFT JOIN tpc_coordinator c USING (tx_id) WHERE o.published_at IS NULL AND o.disposition IS NULL ORDER BY o.id;` and `GET /tpc/transactions/<txId>`. Only if a transaction can never finish (e.g. its log entry was lost) drop the message with `UPDATE outbox SET disposition = 'discarded' WHERE id = <id>;`.
+
 **Replicas:** **exactly 1. No HPA.** It is the 3PC coordinator and runs recovery at startup; two coordinators would race on the same transactions. Use `strategy: Recreate` so a rollout never overlaps two pods. A restart is safe (recovery handles it).
 
 ---

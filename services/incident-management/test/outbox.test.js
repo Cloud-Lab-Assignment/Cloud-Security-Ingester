@@ -174,3 +174,63 @@ test('a status change queued behind a held-back 3PC row keeps its place (R2-5)',
     ['incident.created', 'incident.status_changed'],
   );
 });
+
+test('a held 3PC row whose transaction ended ABORTED is discarded and unblocks the incident (R3-4)', { skip }, async () => {
+  await createOutboxRelay({ pool: db.pool, producer: fakeProducer(), topic: 't', logger: silentLogger }).publishPending();
+  const eventStore = fakeEventStore();
+  eventStore.doCommit = async () => {
+    throw new Error('event-store down');
+  };
+  const gated = createIncidentService({
+    pool: db.pool,
+    repo,
+    eventStore,
+    config: { tpcTimeoutMs: 500, tpcParticipantTimeoutMs: 60_000, correlationWindowMs: 900_000 },
+    logger: silentLogger,
+  });
+  const { incident, txId } = await gated.upsertIncident(candidate());
+  // The documented timeout split: the coordinator's decision ends up ABORTED.
+  await db.pool.query(`UPDATE tpc_coordinator SET state = 'ABORTED', reason = 'split' WHERE tx_id = $1`, [txId]);
+  await repo.updateStatus(incident.incidentId, { status: 'investigating', version: 1 });
+
+  const errors = [];
+  const logger = { ...silentLogger, error: (obj, msg) => errors.push({ obj, msg }) };
+  const producer = fakeProducer();
+  const relay = createOutboxRelay({ pool: db.pool, producer, topic: 't', logger });
+  assert.equal(await relay.publishPending(), 1, 'the status change is no longer blocked');
+  assert.deepEqual(producer.sent.flatMap((r) => r.messages.map((m) => JSON.parse(m.value).type)), ['incident.status_changed']);
+  const { rows } = await db.pool.query(
+    `SELECT type, disposition, published_at IS NULL AS unpublished FROM outbox WHERE incident_id = $1 ORDER BY id`,
+    [incident.incidentId],
+  );
+  assert.deepEqual(rows, [
+    { type: 'incident.created', disposition: 'discarded', unpublished: true },
+    { type: 'incident.status_changed', disposition: null, unpublished: false },
+  ]);
+  assert.ok(errors.some((e) => e.obj?.txId === txId), 'the discard is logged at error level');
+});
+
+test('outbox_held_rows counts 3PC rows held for more than 5 minutes; PRECOMMITTED is never discarded (R3-4)', { skip }, async () => {
+  await createOutboxRelay({ pool: db.pool, producer: fakeProducer(), topic: 't', logger: silentLogger }).publishPending();
+  const eventStore = fakeEventStore();
+  eventStore.doCommit = async () => {
+    throw new Error('event-store down');
+  };
+  const gated = createIncidentService({
+    pool: db.pool,
+    repo,
+    eventStore,
+    config: { tpcTimeoutMs: 500, tpcParticipantTimeoutMs: 60_000, correlationWindowMs: 900_000 },
+    logger: silentLogger,
+  });
+  const { incident } = await gated.upsertIncident(candidate());
+  const relay = createOutboxRelay({ pool: db.pool, producer: fakeProducer(), topic: 't', logger: silentLogger });
+  assert.equal(await relay.heldRows(), 0, 'held for less than 5 minutes');
+  await db.pool.query(`UPDATE outbox SET created_at = now() - interval '10 minutes' WHERE incident_id = $1`, [incident.incidentId]);
+  assert.equal(await relay.heldRows(), 1);
+  await relay.publishPending();
+  const { rows } = await db.pool.query('SELECT disposition FROM outbox WHERE incident_id = $1', [incident.incidentId]);
+  assert.equal(rows[0].disposition, null, 'a PRECOMMITTED row is never auto-expired');
+  // Leave nothing held for later tests.
+  await db.pool.query(`UPDATE outbox SET published_at = now() WHERE incident_id = $1`, [incident.incidentId]);
+});

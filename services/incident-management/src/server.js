@@ -57,7 +57,7 @@ async function main() {
   await migrate(pool, { logger });
   await producer.connect();
 
-  const outbox = createOutboxRelay({ pool, producer, topic: config.incidentTopic, logger });
+  const outbox = createOutboxRelay({ pool, producer, topic: config.incidentTopic, logger, registry: app.metrics });
   const eventStore = createEventStoreParticipant({ baseUrl: config.eventStoreUrl, timeoutMs: config.tpcTimeoutMs });
   const service = createIncidentService({
     pool,

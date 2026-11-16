@@ -1,3 +1,4 @@
+import promClient from 'prom-client';
 import { incidentUpdateMessage } from './publisher.js';
 
 // Queue an incident-updates message inside the caller's transaction (`db` is a
@@ -22,7 +23,40 @@ const RELAY_LOCK_KEY = 527_25_5;
 // Publishes unpublished outbox rows in id order and marks them published.
 // Delivery is at-least-once: a crash between the Kafka ack and the UPDATE
 // re-sends those rows, so consumers dedupe on (incidentId, version, type).
-export function createOutboxRelay({ pool, producer, topic, logger, intervalMs = 1000, batchSize = 100 }) {
+// A 3PC row held back (its transaction not COMMITTED) for longer than this is
+// counted in outbox_held_rows, so a stuck incident is visible (R3-4).
+const HELD_ALERT_MS = 5 * 60 * 1000;
+
+export function createOutboxRelay({ pool, producer, topic, logger, intervalMs = 1000, batchSize = 100, registry }) {
+  // Rows held back by the 3PC gate (not discarded, transaction not COMMITTED)
+  // and older than HELD_ALERT_MS.
+  async function heldRows() {
+    const { rows } = await pool.query(
+      `SELECT count(*)::int AS n FROM outbox o
+        WHERE o.published_at IS NULL AND o.disposition IS NULL AND o.tx_id IS NOT NULL
+          AND o.created_at < now() - ($1::int * interval '1 millisecond')
+          AND NOT EXISTS (SELECT 1 FROM tpc_coordinator c WHERE c.tx_id = o.tx_id AND c.state = 'COMMITTED')`,
+      [HELD_ALERT_MS],
+    );
+    return rows[0].n;
+  }
+
+  if (registry) {
+    // eslint-disable-next-line no-new
+    new promClient.Gauge({
+      name: 'outbox_held_rows',
+      help: 'incident-updates outbox rows held back for over 5 minutes because their 3PC transaction is not COMMITTED',
+      registers: [registry],
+      async collect() {
+        try {
+          this.set(await heldRows());
+        } catch (err) {
+          logger?.warn({ err }, 'outbox_held_rows query failed');
+        }
+      },
+    });
+  }
+
   async function publishPending() {
     const client = await pool.connect();
     try {
@@ -30,16 +64,34 @@ export function createOutboxRelay({ pool, producer, topic, logger, intervalMs = 
       // Serialise batches across relays: a second relay waits here until the
       // first one's batch is published and marked, then continues after it.
       await client.query('SELECT pg_advisory_xact_lock($1)', [RELAY_LOCK_KEY]);
+      // The coordinator's decision wins: a 3PC row whose transaction ended
+      // ABORTED (only possible after a timeout split) is never published and
+      // must not block the incident's later rows (R3-4). PRECOMMITTED rows are
+      // never expired: recovery will still commit them.
+      const discarded = await client.query(
+        `UPDATE outbox o SET disposition = 'discarded'
+           FROM tpc_coordinator c
+          WHERE o.published_at IS NULL AND o.disposition IS NULL
+            AND o.tx_id = c.tx_id AND c.state = 'ABORTED'
+          RETURNING o.id, o.incident_id, o.tx_id, o.type`,
+      );
+      for (const r of discarded.rows) {
+        logger?.error(
+          { outboxId: String(r.id), incidentId: r.incident_id, txId: r.tx_id, type: r.type },
+          'discarding outbox row: its 3PC transaction is ABORTED although Postgres applied it (atomicity split)',
+        );
+      }
       // A 3PC row is held back until its transaction is COMMITTED in the
       // coordinator log, and so is every later row of the same incident, so
       // per-incident order is kept (a PATCH can follow a commit whose
       // event-store doCommit is still unacknowledged).
       const { rows } = await client.query(
         `SELECT o.id, o.incident_id, o.payload FROM outbox o
-          WHERE o.published_at IS NULL
+          WHERE o.published_at IS NULL AND o.disposition IS NULL
             AND NOT EXISTS (
               SELECT 1 FROM outbox g
-               WHERE g.published_at IS NULL AND g.incident_id = o.incident_id AND g.id <= o.id
+               WHERE g.published_at IS NULL AND g.disposition IS NULL
+                 AND g.incident_id = o.incident_id AND g.id <= o.id
                  AND g.tx_id IS NOT NULL
                  AND NOT EXISTS (
                    SELECT 1 FROM tpc_coordinator c WHERE c.tx_id = g.tx_id AND c.state = 'COMMITTED'))
@@ -79,6 +131,7 @@ export function createOutboxRelay({ pool, producer, topic, logger, intervalMs = 
   }
   return {
     publishPending,
+    heldRows,
     start() {
       if (timer) return;
       timer = setInterval(() => {
