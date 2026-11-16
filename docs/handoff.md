@@ -129,6 +129,10 @@ The image bakes in the AWS RDS CA bundle at `/etc/ssl/rds/global-bundle.pem`.
 
 **Orphaned 3PC records (`tpc_participant_orphaned`):** a PRECOMMITTED Postgres participant record whose transaction has no coordinator log entry. The coordinator logs every transaction before asking for votes, so this gauge should stay 0; each orphan is also logged at error level. It is never committed or aborted automatically. Check `GET /tpc/transactions/<txId>` and the event-store's correlation history, then decide by hand.
 
+**3PC timeouts (how the settings relate):** each participant call is bounded by `TPC_TIMEOUT_MS` (the event-store HTTP adapter uses the same deadline; keep it ≤ `TPC_TIMEOUT_MS`). `doCommit`/`abort` are retried up to 5 times, so one unacknowledged send takes at most about `5 × TPC_TIMEOUT_MS` + 2 s. A request waits at most `2 × TPC_TIMEOUT_MS × 5` (30 s at the default) for a busy transaction and then gets gRPC `UNAVAILABLE`; the correlation-engine retries. The recovery pass runs every `TPC_RECOVERY_INTERVAL_MS` (15 s).
+
+**Event Store `HistoryConflict`:** an event-store record stuck PRECOMMITTED, with `HistoryConflict` errors in the event-store logs and "did not ack" in incident-management's recovery logs every 15 s, means another transaction already owns that `(correlationId, version)` history row. Nothing is acknowledged automatically. Compare both transactions (`GET /tpc/transactions/<txId>`, `GET /correlations/<correlationId>` on the event-store) and resolve by hand.
+
 **Replicas:** **exactly 1. No HPA.** It is the 3PC coordinator and runs recovery at startup; two coordinators would race on the same transactions. Use `strategy: Recreate` so a rollout never overlaps two pods. A restart is safe (recovery handles it).
 
 ---

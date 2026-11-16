@@ -104,15 +104,18 @@ stateDiagram-v2
   state "Participant" as P {
     [*] --> UNCERTAIN: canCommit, votes yes
     [*] --> ABORTED: canCommit, votes no
+    [*] --> ABORTED: abort of an unknown tx (tombstone)
     UNCERTAIN --> PRECOMMITTED: preCommit
-    UNCERTAIN --> ABORTED: abort, or timeout
-    UNCERTAIN --> COMMITTED: timeout, coordinator reports COMMITTED
-    PRECOMMITTED --> COMMITTED: doCommit, or timeout
-    PRECOMMITTED --> ABORTED: abort
+    UNCERTAIN --> ABORTED: abort, or timeout (coordinator ABORTED, unknown or unreachable)
+    UNCERTAIN --> COMMITTED: timeout (coordinator COMMITTED)
+    PRECOMMITTED --> COMMITTED: doCommit, or timeout (coordinator COMMITTED or unreachable)
+    PRECOMMITTED --> ABORTED: abort, or timeout (coordinator ABORTED)
   }
 ```
 
 Coordinator log (Postgres `tpc_coordinator`): `WAITING` → `PRECOMMITTED` → `COMMITTED`, or `ABORTED` from either of the first two.
+
+Timeout guards (in parentheses above): on a timeout a participant first asks the coordinator. It waits while the answer is `PENDING`, and a `PRECOMMITTED` record the coordinator has no entry for is kept for an operator rather than committed. The `abort` of an unknown transaction leaves an `ABORTED` tombstone, so a late `canCommit` for it votes no.
 
 ### Protocol
 
@@ -125,7 +128,7 @@ Coordinator log (Postgres `tpc_coordinator`): `WAITING` → `PRECOMMITTED` → `
 
 Participant state changes are **conditional writes** in both stores (DynamoDB condition expression, Postgres `UPDATE … WHERE state = expected`). Several Event Store replicas can therefore serve the same transaction: if one replica's timeout sweep and another's `preCommit` race, exactly one write wins and the loser re-reads and re-evaluates.
 
-The coordinator serialises `run()` and recovery **per transaction** and, inside that lock, recovery re-reads the transaction's current log state, so it never acts on a stale snapshot: it skips finished transactions and never writes `ABORTED` over one that has reached `PRECOMMITTED`.
+The coordinator serialises `run()` and recovery **per transaction** and, inside that lock, recovery re-reads the transaction's current log state, so it never acts on a stale snapshot: it skips finished transactions, and a stale `WAITING` snapshot can no longer turn into an `ABORTED` over a transaction that has since reached `PRECOMMITTED`. Recovery still writes `ABORTED` over a `PRECOMMITTED` entry when replaying `preCommit` finds a participant that already aborted (it timed out in `UNCERTAIN` before receiving `preCommit`); that is the correct 3PC outcome, the same as `run()`'s `precommit_failed`.
 
 ### Timeouts and recovery
 
@@ -142,6 +145,9 @@ The coordinator serialises `run()` and recovery **per transaction** and, inside 
     - If one is unreachable, the transaction stays `PRECOMMITTED` and the next pass retries.
     - Otherwise recovery sends `doCommit` to all and logs `COMMITTED`.
 - **Fault injection for the demo:** `TPC_FORCE_VOTE=no` on the Event Store, and `TPC_FAULT=crash-after-precommit` on Incident Management. The latter exits the process after all `preCommit` acknowledgements. `scripts/demo-3pc.sh` shows all three outcomes; its recorded output is in `docs/handoff.md`.
+
+- **Deadlines (no unbounded waits):** every participant call is raced against `TPC_TIMEOUT_MS` (3 s); `doCommit` and `abort` are retried up to 5 times, a timeout counting as a failed attempt. A `run()` waits at most `2 × TPC_TIMEOUT_MS × 5` (30 s) for its transaction's lock and otherwise fails with `CoordinatorBusy` without writing anything (the gRPC caller gets `UNAVAILABLE` and retries). Recovery bounds each transaction the same way and moves on. A lock is never released while the work it guards can still change state; a participant call that times out and lands late is harmless, because the decision is logged before it is sent and participants only make conditional, idempotent writes.
+- **Sweeps keep going:** a participant record whose commit fails (for example an Event Store history conflict) is left as it is, logged at error level and reported as pending, and the sweep carries on with the other records.
 
 ### When the atomicity guarantee holds
 
@@ -168,7 +174,9 @@ In 2PC, a participant that voted yes and then loses the coordinator is **blocked
 - **Status changes are not 3PC:** an analyst `PATCH` is a local update with optimistic locking. It is serialised with the 3PC vote by the per-incident advisory lock and refused (409 `transaction_pending`) while a correlation transaction for that incident is in flight, so it can never invalidate a decided commit.
 - **In-memory correlation windows:** windows live in the Correlation Engine replica that owns the partition, and groups are evicted 2 windows after they close. After a rebalance or eviction, the new owner starts new groups. Incident Management merges them into the open incident for the same entity when the windows overlap, and an alert can belong to only one incident (unique `alert_id`), so a redelivered alert never creates a duplicate incident.
 - **Escalation after a rebalance (P2-2, not implemented):** the engine sends aggregated `severity` and `eventCount` per group. When a rebalanced engine's new group merges into an existing incident, Incident Management takes the maximum severity and event count, but it cannot re-derive "≥ 3 alerts or ≥ 2 rules → critical" from the merged set, because per-alert severity and event counts aren't sent or stored. Fixing it needs a per-alert summary in the gRPC request and in `incident_alerts`.
-- **Delivery semantics:** `incident-updates` is at-least-once (outbox relay); consumers dedupe on `incidentId` + `version` + `type`. Relay batches are serialised by an advisory lock, and a 3PC message (with every later message of the same incident) is held back until the coordinator logs the transaction `COMMITTED`, so consumers never see a change the Event Store hasn't committed and always see an incident's versions in order.
+- **Hung database calls:** a coordinator-log (Postgres) call that hangs keeps that one transaction's lock until it returns. Its callers are bounded (`CoordinatorBusy`, recovery skips it), but the call itself isn't: the Postgres pool sets no `statement_timeout`. Setting one would bound it.
+- **History conflicts need an operator:** if another transaction already owns an Event Store history row for the same `(correlationId, version)`, the Event Store refuses to acknowledge `doCommit` and stays `PRECOMMITTED`; recovery keeps retrying and logging until someone resolves it (see `docs/handoff.md`).
+- **Delivery semantics:** `incident-updates` is at-least-once (outbox relay); consumers dedupe on `incidentId` + `version` + `type`. Relay batches are serialised by an advisory lock, and a 3PC message (with every later message of the same incident) is held back until the coordinator logs the transaction `COMMITTED`, so consumers never see a change the Event Store hasn't committed and always see an incident's versions in order. If a held message's transaction ends `ABORTED` (only after a timeout split), the relay marks it `discarded`, logs it at error level and releases the incident's later messages; the coordinator's decision wins. A `PRECOMMITTED` one is never expired; `outbox_held_rows` shows messages held for over 5 minutes.
 
 ## Deployment (AWS, requirement c/d context)
 
