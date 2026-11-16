@@ -212,7 +212,7 @@ test('concurrent doCommit calls apply once', async () => {
 
 // --- Conditional writes (P0-3): two replicas sharing one store ---
 
-// A view of `shared` whose next put first runs `hook` (once), simulating
+// A view of `shared` whose next put/commit first runs `hook` (once), simulating
 // another replica writing between this replica's read and its write.
 function interleaved(shared) {
   let hook = null;
@@ -226,6 +226,15 @@ function interleaved(shared) {
         if (h) await h();
         return shared.put(record, expected);
       },
+      // Only when the shared store has the atomic commit (R2-2).
+      ...(shared.commit && {
+        async commit(record, expected) {
+          const h = hook;
+          hook = null;
+          if (h) await h();
+          return shared.commit(record, expected);
+        },
+      }),
     },
     beforeNextPut(fn) {
       hook = fn;
@@ -473,4 +482,171 @@ test('sweep: a record decided while the coordinator was being asked is left alon
   assert.deepEqual(await p.sweep(), { committed: [], aborted: [], pending: [] });
   assert.equal(await stateOf(ctx.store, 't1'), 'ABORTED');
   assert.equal(ctx.applied.length, 0);
+});
+
+// --- Atomic business write + COMMITTED (R2-2) ---
+
+// "No business write without COMMITTED, and no COMMITTED without a business write."
+async function assertAtomic(store, writes, txIds) {
+  for (const txId of txIds) {
+    const committed = (await store.get(txId))?.state === 'COMMITTED';
+    const written = writes.some((w) => w.txId === txId);
+    assert.equal(written, committed, `${txId}: business write ${written}, COMMITTED ${committed}`);
+  }
+}
+
+// Two replicas on one atomic store. `apply` records into the same list, so a
+// participant that still applied outside store.commit would show up.
+function atomicReplicas() {
+  const writes = [];
+  const shared = memoryStore({ businessWrites: writes });
+  const clock = fakeClock();
+  const view = interleaved(shared);
+  const make = (store) =>
+    createParticipant({
+      store,
+      validate: async () => true,
+      apply: async (payload) => {
+        writes.push({ txId: payload.txId, payload, via: 'apply' });
+      },
+      timeoutMs: 1000,
+      now: clock.now,
+    });
+  return { writes, shared, clock, view, a: make(view.store), b: make(shared) };
+}
+
+test('race: doCommit on one replica while another aborts → no business write, ABORTED', async () => {
+  const { a, b, shared, view, writes } = atomicReplicas();
+  await a.canCommit('t1', { txId: 't1', x: 1 });
+  await a.preCommit('t1');
+  view.beforeNextPut(() => b.abort('t1'));
+  await assert.rejects(a.doCommit('t1'), (e) => e instanceof TpcStateError && e.state === 'ABORTED');
+  assert.equal((await shared.get('t1')).state, 'ABORTED');
+  assert.deepEqual(writes, []);
+  await assertAtomic(shared, writes, ['t1']);
+});
+
+test('race: sweep timeout-commit on one replica while another aborts → no business write', async () => {
+  const { a, b, shared, clock, view, writes } = atomicReplicas();
+  await a.canCommit('t1', { txId: 't1' });
+  await a.preCommit('t1');
+  clock.advance(1001);
+  view.beforeNextPut(() => b.abort('t1'));
+  assert.deepEqual(await a.sweep(), { committed: [], aborted: [], pending: [] });
+  assert.equal((await shared.get('t1')).state, 'ABORTED');
+  await assertAtomic(shared, writes, ['t1']);
+});
+
+test('race: abort on one replica while another commits → one business write, COMMITTED', async () => {
+  const { a, b, shared, view, writes } = atomicReplicas();
+  await a.canCommit('t1', { txId: 't1' });
+  await a.preCommit('t1');
+  view.beforeNextPut(() => b.doCommit('t1'));
+  await assert.rejects(a.abort('t1'), (e) => e instanceof TpcStateError && e.state === 'COMMITTED');
+  assert.equal(writes.length, 1);
+  await assertAtomic(shared, writes, ['t1']);
+});
+
+test('every commit path uses store.commit (expected state = the one read), never apply + put', async () => {
+  const writes = [];
+  const inner = memoryStore({ businessWrites: writes });
+  const commits = [];
+  const puts = [];
+  const store = {
+    get: (id) => inner.get(id),
+    listPending: () => inner.listPending(),
+    put: (rec, expected) => {
+      puts.push(rec.state);
+      return inner.put(rec, expected);
+    },
+    commit: (rec, expected) => {
+      commits.push([rec.txId, rec.state, expected]);
+      return inner.commit(rec, expected);
+    },
+  };
+  const clock = fakeClock();
+  let applied = 0;
+  const decisions = { t3: 'COMMITTED', t4: 'COMMITTED' };
+  const p = createParticipant({
+    store,
+    validate: async () => true,
+    apply: async () => {
+      applied += 1;
+    },
+    timeoutMs: 1000,
+    now: clock.now,
+    resolve: async (txId) => decisions[txId] ?? null,
+  });
+  await p.canCommit('t1', { n: 1 }); // doCommit
+  await p.preCommit('t1');
+  await p.doCommit('t1');
+  await p.canCommit('t2', { n: 2 }); // sweep timeout rule, PRECOMMITTED
+  await p.preCommit('t2');
+  await p.canCommit('t3', { n: 3 }); // coordinator says COMMITTED, from UNCERTAIN
+  await p.canCommit('t4', { n: 4 }); // coordinator says COMMITTED, from PRECOMMITTED
+  await p.preCommit('t4');
+  clock.advance(1001);
+  assert.deepEqual(await p.sweep(), { committed: ['t2', 't3', 't4'], aborted: [], pending: [] });
+  assert.equal(applied, 0);
+  assert.ok(!puts.includes('COMMITTED'));
+  assert.deepEqual(commits, [
+    ['t1', 'COMMITTED', { state: 'PRECOMMITTED' }],
+    ['t2', 'COMMITTED', { state: 'PRECOMMITTED' }],
+    ['t3', 'COMMITTED', { state: 'UNCERTAIN' }],
+    ['t4', 'COMMITTED', { state: 'PRECOMMITTED' }],
+  ]);
+  assert.deepEqual(
+    writes.map((w) => [w.txId, w.payload]),
+    [['t1', { n: 1 }], ['t2', { n: 2 }], ['t3', { n: 3 }], ['t4', { n: 4 }]],
+  );
+  // A repeated doCommit is a no-op.
+  await p.doCommit('t1');
+  assert.equal(commits.length, 4);
+  await assertAtomic(inner, writes, ['t1', 't2', 't3', 't4']);
+});
+
+test('store.commit failing (store down) leaves PRECOMMITTED and nothing written; retry commits', async () => {
+  const writes = [];
+  const inner = memoryStore({ businessWrites: writes });
+  let down = true;
+  const store = {
+    ...inner,
+    get: (id) => inner.get(id),
+    listPending: () => inner.listPending(),
+    put: (r, e) => inner.put(r, e),
+    commit: (r, e) => (down ? Promise.reject(new Error('db down')) : inner.commit(r, e)),
+  };
+  const p = createParticipant({ store, validate: async () => true, timeoutMs: 1000 });
+  await p.canCommit('t1', { z: 3 });
+  await p.preCommit('t1');
+  await assert.rejects(p.doCommit('t1'), /db down/);
+  assert.equal((await inner.get('t1')).state, 'PRECOMMITTED');
+  assert.deepEqual(writes, []);
+  down = false;
+  await p.doCommit('t1');
+  assert.deepEqual(writes, [{ txId: 't1', payload: { z: 3 } }]);
+  await assertAtomic(inner, writes, ['t1']);
+});
+
+test('memory store commit: conditional, atomic and idempotent', async () => {
+  const writes = [];
+  const s = memoryStore({ businessWrites: writes });
+  const rec = { txId: 't', state: 'COMMITTED', payload: { a: 1 }, updatedAt: 2 };
+  await s.put({ txId: 't', state: 'UNCERTAIN', payload: { a: 1 }, updatedAt: 1 }, { state: null });
+  await assert.rejects(s.commit(rec, { state: 'PRECOMMITTED' }), StoreConflict);
+  assert.deepEqual(writes, []);
+  await s.commit(rec, { state: 'UNCERTAIN' });
+  assert.equal((await s.get('t')).state, 'COMMITTED');
+  // Retry after a crash: already COMMITTED → conflict, nothing written twice.
+  await assert.rejects(s.commit(rec, { state: 'UNCERTAIN' }), StoreConflict);
+  assert.equal(writes.length, 1);
+  // A business write left by pre-R2-2 code (apply ran, COMMITTED was not
+  // recorded): commit only moves the state.
+  writes.push({ txId: 'legacy', payload: {} });
+  await s.put({ txId: 'legacy', state: 'PRECOMMITTED', payload: {}, updatedAt: 1 }, { state: null });
+  await s.commit({ txId: 'legacy', state: 'COMMITTED', payload: {}, updatedAt: 2 }, { state: 'PRECOMMITTED' });
+  assert.equal((await s.get('legacy')).state, 'COMMITTED');
+  assert.equal(writes.filter((w) => w.txId === 'legacy').length, 1);
+  // Without businessWrites there is no commit (apply + put path).
+  assert.equal(memoryStore().commit, undefined);
 });

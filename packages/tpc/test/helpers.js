@@ -4,10 +4,30 @@ import { StoreConflict } from '../src/index.js';
 // put(record, expected) honours the conditional-write contract: when
 // `expected` is given, the current state must equal expected.state (null =
 // the record must not exist), otherwise StoreConflict is thrown.
-export function memoryStore() {
+//
+// memoryStore({businessWrites}) also implements the atomic commit contract
+// (R2-2): commit(record, expected) records the business write for
+// record.payload in `businessWrites` (an array of {txId, payload}) and sets the
+// state to COMMITTED in one step, or does neither and throws StoreConflict.
+// A business write already present for the txId is not repeated (like the
+// stores' unique key), so a retry after a crash only moves the state.
+export function memoryStore({ businessWrites } = {}) {
   const map = new Map();
+  const atomic = businessWrites
+    ? {
+        async commit(record, expected) {
+          const current = map.get(record.txId)?.state ?? null;
+          if (current !== expected.state) throw new StoreConflict(record.txId, expected.state, current);
+          if (!businessWrites.some((w) => w.txId === record.txId)) {
+            businessWrites.push({ txId: record.txId, payload: structuredClone(record.payload) });
+          }
+          map.set(record.txId, structuredClone(record));
+        },
+      }
+    : {};
   return {
     map,
+    ...atomic,
     async get(txId) {
       const r = map.get(txId);
       return r ? structuredClone(r) : null;

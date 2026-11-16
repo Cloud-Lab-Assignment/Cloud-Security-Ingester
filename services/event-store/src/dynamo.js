@@ -1,6 +1,13 @@
 import { createHash } from 'node:crypto';
 import { DynamoDBClient, DescribeTableCommand } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
+import {
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+  QueryCommand,
+  ScanCommand,
+  TransactWriteCommand,
+} from '@aws-sdk/lib-dynamodb';
 import { StoreConflict } from '@core/tpc';
 import { awsClientOptions } from './aws-options.js';
 
@@ -71,6 +78,13 @@ export function storageKey(entityKey) {
 }
 
 const isConditionFailure = (err) => err?.name === 'ConditionalCheckFailedException';
+
+// The correlation-history row for a committed 3PC record (R2-2). The txId was
+// folded into the payload at canCommit; recordedAt is the commit time.
+export function correlationItem({ txId, payload, updatedAt }) {
+  const { txId: _folded, ...rest } = payload;
+  return { ...rest, txId, recordedAt: new Date(updatedAt).toISOString() };
+}
 
 // Canonical millisecond ISO form so sort keys compare correctly as strings.
 const canonicalTime = (t) => new Date(t).toISOString();
@@ -193,10 +207,18 @@ export function createDynamoRepo({ doc, tablePrefix }) {
     return items;
   }
 
+  // `state` is a reserved word. A missing item fails this check too.
+  const stateIs = (state) => ({
+    ConditionExpression: '#s = :expected',
+    ExpressionAttributeNames: { '#s': 'state' },
+    ExpressionAttributeValues: { ':expected': state },
+  });
+
   // Participant state for @core/tpc: records are {txId, state, payload, updatedAt}.
   // put(record, expected) is a conditional write when `expected` is given:
   // {state: null} = the record must not exist, {state: S} = its state must be S.
   // A failed condition (another replica wrote first) becomes StoreConflict.
+  // commit(record, expected) is the atomic "apply + COMMITTED" (R2-2).
   const tpcStore = {
     async get(txId) {
       const out = await doc.send(new GetCommand({ TableName: tables.tpc, Key: { txId }, ConsistentRead: true }));
@@ -208,16 +230,59 @@ export function createDynamoRepo({ doc, tablePrefix }) {
           ? {}
           : expected.state === null
             ? { ConditionExpression: 'attribute_not_exists(txId)' }
-            : {
-                // `state` is a reserved word. A missing item fails this check too.
-                ConditionExpression: '#s = :expected',
-                ExpressionAttributeNames: { '#s': 'state' },
-                ExpressionAttributeValues: { ':expected': expected.state },
-              };
+            : stateIs(expected.state);
       try {
         await doc.send(new PutCommand({ TableName: tables.tpc, Item: record, ...condition }));
       } catch (err) {
-        if (isConditionFailure(err)) throw new StoreConflict(record.txId, expected.state);
+        if (expected === undefined) throw err;
+        // A put racing another replica's commit transaction on the same item
+        // is rejected with TransactionConflictException: re-read as well.
+        if (isConditionFailure(err) || err?.name === 'TransactionConflictException') {
+          throw new StoreConflict(record.txId, expected.state);
+        }
+        throw err;
+      }
+    },
+    // One TransactWriteItems: the correlation-history row (unique per
+    // correlationId + version) and the move to COMMITTED, conditional on the
+    // state the participant read. Either both happen or neither does.
+    // Cancellation reasons, in TransactItems order [history, tpc]:
+    //  - tpc ConditionalCheckFailed / TransactionConflict: the record changed
+    //    (e.g. another replica aborted or committed it) -> StoreConflict, the
+    //    participant re-reads. This also covers a retry after a crash where
+    //    the transaction had gone through: the re-read finds COMMITTED.
+    //  - only the history condition failed: the row already exists although
+    //    the record is still in the expected state. Atomic commits cannot
+    //    leave that behind, so it is a row written by the pre-R2-2 apply-then-
+    //    put path (or by another tx for the same correlationId + version, which
+    //    the old apply also treated as "duplicate"). Keep that row and make
+    //    the state move alone, still conditionally.
+    async commit(record, expected) {
+      try {
+        await doc.send(
+          new TransactWriteCommand({
+            TransactItems: [
+              {
+                Put: {
+                  TableName: tables.correlations,
+                  Item: correlationItem(record),
+                  ConditionExpression: 'attribute_not_exists(correlationId)',
+                },
+              },
+              { Put: { TableName: tables.tpc, Item: record, ...stateIs(expected.state) } },
+            ],
+          }),
+        );
+      } catch (err) {
+        if (err?.name !== 'TransactionCanceledException') throw err;
+        const [history, tpc] = (err.CancellationReasons ?? []).map((r) => r?.Code ?? 'None');
+        if (tpc === 'ConditionalCheckFailed' || tpc === 'TransactionConflict') {
+          throw new StoreConflict(record.txId, expected.state);
+        }
+        if (history === 'ConditionalCheckFailed' && tpc === 'None') {
+          await tpcStore.put(record, expected);
+          return;
+        }
         throw err;
       }
     },

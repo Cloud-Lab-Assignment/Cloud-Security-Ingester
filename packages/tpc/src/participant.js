@@ -10,21 +10,31 @@ export const ABORTED = 'ABORTED';
 //
 //   canCommit(new)            -> UNCERTAIN (yes) | ABORTED (no)
 //   preCommit  UNCERTAIN      -> PRECOMMITTED
-//   doCommit   PRECOMMITTED   -> apply, COMMITTED
+//   doCommit   PRECOMMITTED   -> apply + COMMITTED
 //   abort      UNCERTAIN|PRECOMMITTED|unknown -> ABORTED
 //   sweep: for each UNCERTAIN/PRECOMMITTED record past timeoutMs, first ask
 //          the coordinator (optional `resolve(txId)`) for its decision:
-//            'COMMITTED' -> apply, COMMITTED   'ABORTED' -> ABORTED
+//            'COMMITTED' -> apply + COMMITTED  'ABORTED' -> ABORTED
 //            'PENDING'   -> untouched (the coordinator is alive and will finish it)
 //            null / error / no answer within resolveTimeoutMs -> timeout rule:
-//              UNCERTAIN -> ABORTED; PRECOMMITTED -> apply, COMMITTED
+//              UNCERTAIN -> ABORTED; PRECOMMITTED -> apply + COMMITTED
 //
-// Store contract: get(txId), listPending(), put(record, expected). Every put
-// passes the state this participant read ({state: null} = "must not exist");
-// the store throws StoreConflict when the record changed in between (another
-// replica sharing the store wrote it). The operation is then re-read and
-// re-evaluated, up to CONFLICT_ATTEMPTS times. `apply` must be idempotent:
-// two replicas can both apply a commit before one of them loses the write.
+// Store contract: get(txId), listPending(), put(record, expected), and
+// optionally commit(record, expected). Every write passes the state this
+// participant read ({state: null} = "must not exist"); the store throws
+// StoreConflict when the record changed in between (another replica sharing
+// the store wrote it). The operation is then re-read and re-evaluated, up to
+// CONFLICT_ATTEMPTS times.
+//
+// "apply + COMMITTED" (R2-2): when the store has commit(record, expected),
+// with record = {txId, state: 'COMMITTED', payload, updatedAt} and
+// expected = {state: 'PRECOMMITTED' | 'UNCERTAIN'}, it is the only commit path:
+// the store performs its business write for `payload` and the move to
+// COMMITTED atomically, or writes nothing and throws StoreConflict. `apply`
+// is then unused (and optional). Stores without commit get apply() followed by
+// a conditional put; there a lost race can leave the business write behind on
+// an ABORTED record, and `apply` must be idempotent because two replicas can
+// both apply before one of them loses the write.
 const CONFLICT_ATTEMPTS = 3;
 
 const DECISIONS = new Set([COMMITTED, ABORTED, 'PENDING']);
@@ -70,7 +80,14 @@ export function createParticipant({
   const record = (txId, state, payload, from) =>
     store.put({ txId, state, payload, updatedAt: now() }, { state: from ?? null });
 
+  // rec is the record as read: PRECOMMITTED, or UNCERTAIN when the
+  // coordinator reported COMMITTED.
+  const atomicCommit = typeof store.commit === 'function';
   async function commitRecord(rec) {
+    if (atomicCommit) {
+      await store.commit({ txId: rec.txId, state: COMMITTED, payload: rec.payload, updatedAt: now() }, { state: rec.state });
+      return;
+    }
     await apply(rec.payload);
     await record(rec.txId, COMMITTED, rec.payload, rec.state);
   }
