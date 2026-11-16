@@ -13,6 +13,7 @@ import {
 } from './tpc-wiring.js';
 import { startGrpc } from './grpc.js';
 import { registerRoutes } from './routes.js';
+import { startRecoveryLoop } from './recovery.js';
 
 const SERVICE = 'incident-management';
 const SWEEP_INTERVAL_MS = 2000;
@@ -97,6 +98,9 @@ async function main() {
   registerRoutes(app, { repo, coordinatorLog });
   await app.listen({ host: '0.0.0.0', port: config.port });
 
+  // Keep finishing deferred transactions without waiting for a restart (P1-2).
+  const recoveryLoop = startRecoveryLoop({ recover: service.recover, intervalMs: config.tpcRecoveryIntervalMs, logger });
+
   // Publish queued incident-updates (transactional outbox) every second.
   outbox.start();
 
@@ -121,6 +125,7 @@ async function main() {
     stopping = true;
     logger.info({ signal }, 'shutting down');
     clearInterval(sweeper);
+    await recoveryLoop.stop();
     await outbox.stop();
     await new Promise((resolve) => grpcServer.tryShutdown(() => resolve()));
     await app.close();

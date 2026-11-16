@@ -22,6 +22,7 @@ export function loadConfig(env = process.env) {
     incidentTopic: str('INCIDENT_TOPIC', 'incident-updates'),
     tpcTimeoutMs: int('TPC_TIMEOUT_MS', 3000),
     tpcParticipantTimeoutMs: int('TPC_PARTICIPANT_TIMEOUT_MS', 10000),
+    tpcRecoveryIntervalMs: int('TPC_RECOVERY_INTERVAL_MS', 15000),
     correlationWindowMs: int('CORRELATION_WINDOW_MS', 900000),
     tpcFault: str('TPC_FAULT', undefined),
   };
