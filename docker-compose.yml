@@ -113,6 +113,8 @@ services:
       TABLE_PREFIX: cs-
       TPC_TIMEOUT_MS: 10000
       TPC_FORCE_VOTE: ${ES_TPC_FORCE_VOTE:-}
+      # Ask the coordinator for its decision before acting on a 3PC timeout (P0-4).
+      COORDINATOR_URL: http://incident-management:8082
     depends_on:
       kafka:
         condition: service_healthy
