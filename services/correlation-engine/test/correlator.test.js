@@ -177,3 +177,14 @@ test('eviction watermark is the newest alertTime, capped at wall clock plus a wi
   assert.equal(next.correlationId, first.correlationId);
   assert.equal(next.alertIds.length, 2);
 });
+
+test('replayed old alerts for many entities are evicted without the watermark advancing (R2-7)', () => {
+  const c = createCorrelator({ windowMs: WINDOW, escalateCount: 3, evictEvery: 50, now: () => Date.parse(at(10_000)) });
+  c.ingest(makeAlert({ entityKey: '203.0.113.200', minutes: 1000 })); // sets the watermark
+  // 300 late alerts, each for a new entity and far behind the eviction horizon.
+  for (let i = 0; i < 300; i += 1) {
+    c.ingest(makeAlert({ entityKey: `10.9.${Math.floor(i / 250)}.${i % 250}`, minutes: i % 100 }));
+  }
+  const { groups } = c.stats();
+  assert.ok(groups <= 51, `expected at most evictEvery + 1 groups in memory, got ${groups}`);
+});

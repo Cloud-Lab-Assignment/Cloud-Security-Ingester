@@ -73,7 +73,11 @@ function summarize(alert, seq) {
   };
 }
 
-export function createCorrelator({ windowMs, escalateCount, now = Date.now }) {
+// evictEvery: besides every watermark advance, run the eviction sweep at least
+// once per this many ingests, so a replay of old alerts (which never advances
+// the watermark) cannot accumulate groups without bound (R2-7). One sweep is
+// O(groups), so the amortised cost per ingest stays O(groups / evictEvery).
+export function createCorrelator({ windowMs, escalateCount, now = Date.now, evictEvery = 256 }) {
   if (!(windowMs > 0)) throw new TypeError('windowMs must be > 0');
   if (!(escalateCount > 0)) throw new TypeError('escalateCount must be > 0');
 
@@ -81,6 +85,7 @@ export function createCorrelator({ windowMs, escalateCount, now = Date.now }) {
   const groupByAlertId = new Map(); // alertId -> group
   let seq = 0;
   let watermark = -Infinity; // newest (capped) alertTime seen
+  let ingestsSinceSweep = 0;
 
   function dropGroup(group) {
     const groups = groupsByEntity.get(group.entityKey);
@@ -89,6 +94,7 @@ export function createCorrelator({ windowMs, escalateCount, now = Date.now }) {
   }
 
   function evictExpired() {
+    ingestsSinceSweep = 0;
     const horizon = watermark - 3 * windowMs;
     for (const groups of [...groupsByEntity.values()]) {
       for (const group of [...groups]) {
@@ -199,7 +205,10 @@ export function createCorrelator({ windowMs, escalateCount, now = Date.now }) {
     group.alerts.set(alert.alertId, summary);
     groupByAlertId.set(alert.alertId, group);
     refreshSpan(group);
-    return toCandidate(group);
+    const candidate = toCandidate(group);
+    ingestsSinceSweep += 1;
+    if (ingestsSinceSweep >= evictEvery) evictExpired();
+    return candidate;
   }
 
   // Undo an ingest (used when the upsert failed, so a retry re-sends it).
