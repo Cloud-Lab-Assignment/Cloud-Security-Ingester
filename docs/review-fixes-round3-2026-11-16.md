@@ -95,3 +95,24 @@ Third reviewer verdicts:
 ## Done log
 
 <!-- The box agent appends: item ID, commit SHA, test evidence. -->
+
+### 16 Nov 2026 (box agent)
+
+All ten items are done (R3-1 to R3-10); none needed moving to Known limits. Each behaviour fix had a test that failed on the old code first.
+
+| Item | Commit(s) | Test evidence |
+|---|---|---|
+| R3-1 | `cb9abfe` | Fake-client and DynamoDB Local tests: another tx's history row for the same `(correlationId, version)` → `HistoryConflict`, doCommit not acked, record stays PRECOMMITTED, row unchanged; a legacy row without `txId` only moves the state when `incidentId`, `alertIds` and `decision` match; the matching re-commit test is kept. The participant sweep now logs and skips a record whose commit fails instead of stopping the pass. |
+| R3-2 | `971b2b2` (tpc), `cd90153` (gRPC mapping) | `recover() with an abort that never resolves finishes in bounded time`, `… a doCommit that never resolves leaves the entry PRECOMMITTED for the next pass`, `a queued run() gives up waiting for the txId lock with CoordinatorBusy and writes nothing`, `recover() rejects in bounded time when listUnfinished hangs`, `grpc maps CoordinatorBusy to UNAVAILABLE`. The event-store adapter's deadline already equals `TPC_TIMEOUT_MS`. |
+| R3-3 | `53de431` | `005 backfills tx_id on pre-004 correlation outbox rows so they wait for COMMITTED (R3-3)`: the PRECOMMITTED update and the status change behind it stay held. |
+| R3-4 | `cf13c60` | `a held 3PC row whose transaction ended ABORTED is discarded and unblocks the incident`, `outbox_held_rows counts 3PC rows held for more than 5 minutes; PRECOMMITTED is never discarded`. Migration 006; manual resolution in `docs/handoff.md`. |
+| R3-5 | `5defc00` | `007 recomputes alert_count and the generated title after the 003 dedupe` (custom titles untouched). 003's comment corrected; its SQL unchanged. |
+| R3-6 | `3cd73f0` | `orphaned PRECOMMITTED records are logged and counted`; gauge `tpc_participant_orphaned`. |
+| R3-7 | `f96bc9f` | Docs: diagram guards and tombstone, qualified recovery wording, deadlines, discard rule, new Known limits (hung Postgres calls, history conflicts). |
+| R3-8 | `6b1c814`, `da4d5a9` | `wait_committed` (coordinator COMMITTED and the Event Store's matching version) after every committing scenario; demo exit 0, output re-recorded. |
+| R3-9 | `5c8e278` | README: "Run it locally" at the top; plan and rounds 1–3 listed as history, marked done. |
+| R3-10 | `bb8acdb` | Handoff describes the cursor as opaque (`storageKey(entityKey)` inside). |
+
+Final run on `5c8e278`: `npm test` 217/217 (common 10, tpc 77, event-store 72, incident-management 25, correlation-engine 33); `INTEGRATION=1 npm test -w event-store -w incident-management` 94/94 and 60/60; after `docker compose up -d --build` (migrations 001–007 applied) `npm run test:integration` 2/2 twice and `scripts/demo-3pc.sh` exit 0; `/metrics` shows `outbox_held_rows 0` and `tpc_participant_orphaned 0`; `scripts/export-group-repo.sh` re-run: exported services pass 72 / 25 / 33 and build.
+
+Code frozen. Remaining for Rishit: the ID number in `docs/task_division_rishit.txt`, regenerating the group-repo copy with `scripts/export-group-repo.sh` and opening the PR after agreeing with Ansh, and the group confirmations in the plan's "Before coding" list.
