@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import client from 'prom-client';
-import { createCoordinator, createParticipant, CoordinatorCrash, TpcStateError } from '@core/tpc';
+import { createCoordinator, createParticipant, CoordinatorCrash, StoreConflict, TpcStateError } from '@core/tpc';
 import { withTransaction } from './db.js';
 import { mergeCandidate, rowToIncident } from './incidents.js';
 import { enqueueIncidentUpdate } from './outbox.js';
@@ -36,12 +36,30 @@ export function createPgParticipantStore(pool) {
       const { rows } = await pool.query(`SELECT ${cols} FROM tpc_participant WHERE tx_id = $1`, [txId]);
       return rows[0] ? toRecord(rows[0]) : null;
     },
-    async put({ txId, state, payload, updatedAt }) {
-      await pool.query(
-        `INSERT INTO tpc_participant (tx_id, state, payload, updated_at) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (tx_id) DO UPDATE SET state = EXCLUDED.state, payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at`,
-        [txId, state, payload == null ? null : JSON.stringify(payload), new Date(updatedAt)],
-      );
+    // `expected` (optional): {state: null} = must not exist, {state: S} = must
+    // currently be S. A mismatch throws StoreConflict (P0-3 store contract).
+    async put({ txId, state, payload, updatedAt }, expected) {
+      const params = [txId, state, payload == null ? null : JSON.stringify(payload), new Date(updatedAt)];
+      if (expected === undefined) {
+        await pool.query(
+          `INSERT INTO tpc_participant (tx_id, state, payload, updated_at) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (tx_id) DO UPDATE SET state = EXCLUDED.state, payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at`,
+          params,
+        );
+        return;
+      }
+      const res =
+        expected.state === null
+          ? await pool.query(
+              `INSERT INTO tpc_participant (tx_id, state, payload, updated_at) VALUES ($1, $2, $3, $4)
+               ON CONFLICT (tx_id) DO NOTHING`,
+              params,
+            )
+          : await pool.query(
+              `UPDATE tpc_participant SET state = $2, payload = $3, updated_at = $4 WHERE tx_id = $1 AND state = $5`,
+              [...params, expected.state],
+            );
+      if (res.rowCount === 0) throw new StoreConflict(txId, expected.state);
     },
     async listPending() {
       const { rows } = await pool.query(

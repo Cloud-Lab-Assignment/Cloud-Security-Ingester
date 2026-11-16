@@ -1,11 +1,12 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { CoordinatorCrash } from '@core/tpc';
+import { CoordinatorCrash, StoreConflict } from '@core/tpc';
 import { migrate } from '../src/migrate.js';
 import { createIncidentRepo, VersionConflict, TransactionPending } from '../src/incidents.js';
 import {
   createIncidentService,
   createPgCoordinatorLog,
+  createPgParticipantStore,
   applyDecision,
   IncidentAborted,
   StaleVersion,
@@ -365,4 +366,18 @@ test('findTarget fallback ignores an incident from a different window (P1-6)', {
   // Inside the window just before the incident still matches.
   const justBefore = { ...yesterday, firstSeen: '2026-11-16T08:46:00.000Z', lastSeen: '2026-11-16T08:46:00.000Z' };
   assert.equal((await repo.findTarget(justBefore)).existing?.incidentId, incident.incidentId);
+});
+
+test('postgres participant store honours expected-state writes (P0-3)', { skip }, async () => {
+  const store = createPgParticipantStore(db.pool);
+  const txId = `store-${Date.now()}-${Math.random()}`;
+  const rec = (state) => ({ txId, state, payload: { correlationId: 'x' }, updatedAt: Date.now() });
+  await store.put(rec('UNCERTAIN'), { state: null });
+  await assert.rejects(store.put(rec('UNCERTAIN'), { state: null }), StoreConflict, 'create only if absent');
+  await assert.rejects(store.put(rec('ABORTED'), { state: 'PRECOMMITTED' }), StoreConflict, 'wrong expected state');
+  assert.equal((await store.get(txId)).state, 'UNCERTAIN');
+  await store.put(rec('PRECOMMITTED'), { state: 'UNCERTAIN' });
+  assert.equal((await store.get(txId)).state, 'PRECOMMITTED');
+  await store.put(rec('COMMITTED')); // no expectation: unconditional
+  assert.equal((await store.get(txId)).state, 'COMMITTED');
 });
