@@ -34,7 +34,7 @@ docker build -f services/event-store/Dockerfile -t event-store:<tag> .
 **REST API** (called in-cluster by correlation-engine and incident-management):
 - `GET /events/:eventId`, `GET /events?entityKey=&from=&to=&limit=&cursor=`, `GET /correlations/:correlationId`
 - 3PC participant: `POST /tpc/:txId/can-commit | pre-commit | do-commit | abort`. A state conflict returns **409 `{error:"bad_state", state}`**.
-- A `cursor` must come from the same query: a non-empty `entityKey` (≤ 2048 UTF-8 bytes) equal to the query's, and a non-empty `sk` (≤ 1024 bytes) inside the query's `from`/`to` range. Anything else returns 400.
+- `cursor` is **opaque**: pass the `nextCursor` from the previous page back unchanged, with the same `entityKey`, `from` and `to`. (Decoded, it holds the storage key, i.e. `storageKey(entityKey)`, which is the hashed form for long keys and literal `h:` keys, plus the sort key.) A cursor that doesn't belong to the query returns 400.
 - An `entityKey` longer than 1024 UTF-8 bytes, or one that starts with `h:`, is stored under `h:` + its sha256 and looked up the same way, so callers just pass the original key. `h:` is reserved for these hashed keys.
 
 **Env vars:**
