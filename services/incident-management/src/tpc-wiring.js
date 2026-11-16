@@ -210,7 +210,7 @@ export async function applyDecision(pool, { txId, kind, version, incident, newAl
     const { rows } = await db.query('SELECT * FROM incidents WHERE incident_id = $1', [i.incidentId]);
     const alerts = await db.query('SELECT alert_id FROM incident_alerts WHERE incident_id = $1 ORDER BY alert_id', [i.incidentId]);
     const snapshot = rowToIncident(rows[0], alerts.rows.map((r) => r.alert_id));
-    await enqueueIncidentUpdate(db, kind === 'create' ? 'incident.created' : 'incident.updated', snapshot, now);
+    await enqueueIncidentUpdate(db, kind === 'create' ? 'incident.created' : 'incident.updated', snapshot, now, txId);
   });
 }
 
