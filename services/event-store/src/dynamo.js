@@ -70,11 +70,16 @@ export function decodeCursor(cursor, entityKey) {
 // over MAX_ENTITY_KEY_BYTES of UTF-8 are stored as "h:" + sha256 hex. The
 // original stays in the item (`doc`, and `entityKeyOriginal`), and queries
 // apply the same mapping, so callers only ever see the original key.
+// "h:" is reserved for hashed keys: a literal key starting with it is hashed
+// too (R2-6), so it can never share a partition with a long key's hash.
 export const MAX_ENTITY_KEY_BYTES = 1024;
+const HASHED_PREFIX = 'h:';
 
 export function storageKey(entityKey) {
-  if (Buffer.byteLength(entityKey, 'utf8') <= MAX_ENTITY_KEY_BYTES) return entityKey;
-  return `h:${createHash('sha256').update(entityKey, 'utf8').digest('hex')}`;
+  if (Buffer.byteLength(entityKey, 'utf8') <= MAX_ENTITY_KEY_BYTES && !entityKey.startsWith(HASHED_PREFIX)) {
+    return entityKey;
+  }
+  return `${HASHED_PREFIX}${createHash('sha256').update(entityKey, 'utf8').digest('hex')}`;
 }
 
 const isConditionFailure = (err) => err?.name === 'ConditionalCheckFailedException';

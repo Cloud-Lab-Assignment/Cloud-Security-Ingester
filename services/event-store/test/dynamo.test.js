@@ -50,6 +50,17 @@ test('storageKey keeps keys up to 1024 UTF-8 bytes and hashes longer ones', () =
   assert.match(storageKey('é'.repeat(600)), /^h:[0-9a-f]{64}$/);
 });
 
+test('storageKey also hashes literal keys starting with "h:", so they cannot collide with a hashed key (R2-6)', () => {
+  const sha = (k) => `h:${createHash('sha256').update(k, 'utf8').digest('hex')}`;
+  const long = 'a'.repeat(MAX_ENTITY_KEY_BYTES + 1);
+  // A literal key equal to another key's hashed form gets its own partition.
+  assert.equal(storageKey(sha(long)), sha(sha(long)));
+  assert.notEqual(storageKey(sha(long)), storageKey(long));
+  for (const k of ['h:', 'h:x', 'h:10.0.0.5']) assert.equal(storageKey(k), sha(k), k);
+  // Only the exact lower-case "h:" prefix is reserved.
+  for (const k of ['H:x', 'hx', 'host:h:1', ' h:x']) assert.equal(storageKey(k), k, k);
+});
+
 test('tableNames uses the prefix', () => {
   assert.deepEqual(tableNames('cs-'), {
     events: 'cs-events',
@@ -267,6 +278,18 @@ describe('dynamodb repo (integration)', { skip: !process.env.INTEGRATION }, () =
     assert.deepEqual(page2.items, evs.slice(2));
     // A different long key with the same prefix is a different partition.
     assert.deepEqual((await repo.queryEvents({ ...q, entityKey: `${entityKey}x` })).items, []);
+  });
+
+  test('a literal "h:<sha256>" entityKey and the long key it hashes to stay separate (R2-6)', async () => {
+    const long = `${'z'.repeat(MAX_ENTITY_KEY_BYTES)}-${randomUUID()}`;
+    const literal = `h:${createHash('sha256').update(long, 'utf8').digest('hex')}`;
+    const a = normalizedEvent({ entityKey: long, eventTime: '2026-11-16T05:00:00.000Z' });
+    const b = normalizedEvent({ entityKey: literal, eventTime: '2026-11-16T05:00:00.000Z' });
+    assert.equal(await repo.putEvent(a), 'stored');
+    assert.equal(await repo.putEvent(b), 'stored');
+    const q = { from: '2026-11-16T05:00:00.000Z', to: '2026-11-16T06:00:00.000Z' };
+    assert.deepEqual((await repo.queryEvents({ ...q, entityKey: long })).items, [a]);
+    assert.deepEqual((await repo.queryEvents({ ...q, entityKey: literal })).items, [b]);
   });
 
   test('putCorrelation stores versions once, getCorrelation orders by version', async () => {
