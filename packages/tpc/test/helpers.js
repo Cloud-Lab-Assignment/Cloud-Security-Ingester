@@ -42,6 +42,10 @@ export function memoryLog() {
         .filter((e) => e.state === 'WAITING' || e.state === 'PRECOMMITTED')
         .map((e) => structuredClone(e));
     },
+    async get(txId) {
+      const e = map.get(txId);
+      return e ? structuredClone(e) : null;
+    },
   };
 }
 

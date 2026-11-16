@@ -17,6 +17,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Three-phase commit coordinator. `log` is durable; `participants` are
 // adapters ({name, canCommit, preCommit, doCommit, abort}); `payloads` maps
 // participant name -> that participant's payload.
+//
+// Log contract: put(entry), listUnfinished() -> WAITING/PRECOMMITTED entries,
+// get(txId) -> entry | null. Entries are {txId, state, payloads, updatedAt, reason?}.
 export function createCoordinator({
   log,
   participants,
@@ -81,14 +84,30 @@ export function createCoordinator({
     return { outcome: 'committed' };
   }
 
-  // txIds a run() in this process is driving right now; recover() leaves
-  // them alone so a periodic recovery cannot abort a live transaction.
+  // Per-txId mutex (R2-1): run() holds it for its whole duration and
+  // recovery while it handles that txId, so recovery never acts on a log
+  // entry that run() is changing underneath it.
+  const locks = new Map();
+  function withLock(txId, fn) {
+    const prev = locks.get(txId) ?? Promise.resolve();
+    const result = prev.then(fn, fn);
+    const tail = result.catch(() => {});
+    locks.set(txId, tail);
+    tail.then(() => {
+      if (locks.get(txId) === tail) locks.delete(txId);
+    });
+    return result;
+  }
+
+  // txIds a run() in this process is driving right now. recover() skips them
+  // instead of queueing on their lock, so one slow transaction does not hold
+  // up a recovery pass (the lock alone would also be correct, just slower).
   const inFlight = new Set();
 
   async function run(txId, payloads) {
     inFlight.add(txId);
     try {
-      return await drive(txId, payloads);
+      return await withLock(txId, () => drive(txId, payloads));
     } finally {
       inFlight.delete(txId);
     }
@@ -142,7 +161,9 @@ export function createCoordinator({
   // or a commit whose doCommit was never acked), except those run() is still
   // driving. Safe to call periodically: a call made while another recovery is
   // running does not start a second pass, it joins the running one and
-  // resolves with the same list of finished txIds.
+  // resolves with the same list of finished txIds. (The per-txId lock and
+  // re-read already make overlapping passes safe; joining just avoids
+  // replaying the same transactions twice.)
   let recovering = null;
   function recover() {
     if (!recovering) {
@@ -155,46 +176,59 @@ export function createCoordinator({
 
   async function recoverOnce() {
     const finished = [];
+    // Only a list of candidates: each entry is re-read under its lock before
+    // anything is done, because the snapshot can be stale by then (R2-1).
     const entries = await log.listUnfinished();
-    for (const entry of entries) {
-      const { txId, payloads } = entry;
+    for (const { txId } of entries) {
       if (inFlight.has(txId)) continue;
-      if (entry.state === WAITING) {
-        await abortAll(txId, payloads, 'recovered_waiting');
-        finished.push(txId);
-        continue;
-      }
-      // PRECOMMITTED: replay preCommit. A participant that already committed
-      // on its own timeout counts as an ack; one that already aborted forces
-      // a global abort.
-      let selfAborted = false;
-      let failed = false;
-      for (const p of participants) {
-        try {
-          await withTimeout(Promise.resolve().then(() => p.preCommit(txId)), timeoutMs).then((r) => {
-            if (r === TIMEOUT) throw new Error('preCommit timeout');
-          });
-        } catch (err) {
-          if (err instanceof TpcStateError && err.state === 'COMMITTED') continue;
-          if (err instanceof TpcStateError) selfAborted = true;
-          else failed = true;
-          logger?.warn({ txId, participant: p.name, err: err.message, state: err.state }, '3pc recovery preCommit failed');
-        }
-      }
-      if (selfAborted) {
-        await abortAll(txId, payloads, 'recovered_participant_aborted');
-      } else if (failed) {
-        // Leave the entry PRECOMMITTED: a later recover() retries, and the
-        // participants' own PRECOMMITTED timeouts commit in the meantime.
-        logger?.warn({ txId }, '3pc recovery deferred: participant unreachable');
-        continue;
-      } else {
-        const res = await commitAll(txId, payloads);
-        if (res.pending) continue; // still unacked: stays PRECOMMITTED for the next recover()
-      }
-      finished.push(txId);
+      if (await withLock(txId, () => recoverTx(txId))) finished.push(txId);
     }
     return finished;
+  }
+
+  // Recover one transaction from its current log entry. Returns true when it
+  // reached a final state here.
+  async function recoverTx(txId) {
+    const entry = await log.get(txId);
+    if (!entry) return false;
+    const { state, payloads } = entry;
+    // Finished meanwhile (e.g. by a run() that completed after the snapshot).
+    if (state !== WAITING && state !== 'PRECOMMITTED') return false;
+    if (state === WAITING) {
+      // No commit decision was ever logged: abort is safe.
+      await abortAll(txId, payloads, 'recovered_waiting');
+      return true;
+    }
+    // PRECOMMITTED: replay preCommit. A participant that already committed
+    // counts as an ack; one that already aborted (it never got preCommit and
+    // timed out in UNCERTAIN) forces a global abort, the one case where the
+    // log goes PRECOMMITTED -> ABORTED, as in run()'s precommit_failed.
+    let selfAborted = false;
+    let failed = false;
+    for (const p of participants) {
+      try {
+        await withTimeout(Promise.resolve().then(() => p.preCommit(txId)), timeoutMs).then((r) => {
+          if (r === TIMEOUT) throw new Error('preCommit timeout');
+        });
+      } catch (err) {
+        if (err instanceof TpcStateError && err.state === 'COMMITTED') continue;
+        if (err instanceof TpcStateError) selfAborted = true;
+        else failed = true;
+        logger?.warn({ txId, participant: p.name, err: err.message, state: err.state }, '3pc recovery preCommit failed');
+      }
+    }
+    if (selfAborted) {
+      await abortAll(txId, payloads, 'recovered_participant_aborted');
+      return true;
+    }
+    if (failed) {
+      // Leave the entry PRECOMMITTED: a later recover() retries, and the
+      // participants' own PRECOMMITTED timeouts commit in the meantime.
+      logger?.warn({ txId }, '3pc recovery deferred: participant unreachable');
+      return false;
+    }
+    const res = await commitAll(txId, payloads);
+    return !res.pending; // still unacked: stays PRECOMMITTED for the next recover()
   }
 
   return { run, recover, inFlight: () => [...inFlight] };

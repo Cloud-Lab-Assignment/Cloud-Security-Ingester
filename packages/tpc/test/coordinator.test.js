@@ -458,3 +458,113 @@ test('participant PRECOMMITTED but crashed before acking; coordinator aborted â†
   assert.equal((await bStore.get('tx1')).state, 'ABORTED');
   assert.equal(bApplied.length, 0);
 });
+
+// --- R2-1: recovery must act on the current log state, not its snapshot ---
+
+test('recovery does not abort a tx that run() committed (with pending) after the snapshot', async () => {
+  const trace = [];
+  let gateOpen;
+  const gate = new Promise((r) => {
+    gateOpen = r;
+  });
+  let runB;
+  let bDown = true;
+  const a = makeParticipant('a', trace, {
+    hooks: {
+      // B's vote waits until recovery has taken its snapshot.
+      canCommit: async (txId) => {
+        if (txId === 'B') await gate;
+      },
+      // While recovery aborts the earlier entry A, B runs to completion.
+      abort: async (txId) => {
+        if (txId === 'A') {
+          gateOpen();
+          await runB;
+        }
+      },
+    },
+  });
+  const b = makeParticipant('b', trace, {
+    hooks: {
+      doCommit: async (txId) => {
+        if (txId === 'B' && bDown) throw new Error('down');
+      },
+    },
+  });
+  const { c, log, committed } = coordinator([a, b]);
+  // A: a dead run left WAITING, logged before B.
+  await log.put({ txId: 'A', state: 'WAITING', payloads, updatedAt: Date.now() });
+  runB = c.run('B', payloads);
+  await sleep(1);
+  assert.equal(log.map.get('B').state, 'WAITING');
+
+  const finished = await c.recover();
+  assert.deepEqual(await runB, { outcome: 'committed', pending: ['b'] });
+  assert.deepEqual(finished, ['A']);
+  // B was not aborted: the decision stays commit and is still unfinished.
+  assert.ok(!log.history.includes('B:ABORTED'), log.history.join(','));
+  assert.equal(log.map.get('B').state, 'PRECOMMITTED');
+  assert.equal(await a.state('B'), 'COMMITTED');
+  assert.equal(await b.state('B'), 'PRECOMMITTED');
+  // Only A's abort was sent (once per participant).
+  assert.equal(trace.filter((t) => t === 'a:abort').length, 1);
+  assert.equal(trace.filter((t) => t === 'b:abort').length, 1);
+  assert.equal(committed.length, 0);
+
+  // The next recovery finishes the commit.
+  bDown = false;
+  assert.deepEqual(await c.recover(), ['B']);
+  assert.equal(log.map.get('B').state, 'COMMITTED');
+  assert.equal(await b.state('B'), 'COMMITTED');
+  assert.deepEqual(committed.map((x) => x.txId), ['B']);
+  assert.equal(a.applied.length, 1);
+  assert.equal(b.applied.length, 1);
+});
+
+test('recovery skips an entry that became terminal after the snapshot', async () => {
+  const trace = [];
+  const a = makeParticipant('a', trace);
+  const { log } = coordinator([a]);
+  await log.put({ txId: 'tx1', state: 'WAITING', payloads: { a: {} }, updatedAt: Date.now() });
+  // listUnfinished returns the stale WAITING; by the time recovery reads it
+  // again, it is COMMITTED.
+  const stale = {
+    ...log,
+    async listUnfinished() {
+      const entries = await log.listUnfinished();
+      await log.put({ txId: 'tx1', state: 'COMMITTED', payloads: { a: {} }, updatedAt: Date.now() });
+      return entries;
+    },
+  };
+  const r = createCoordinator({ log: stale, participants: [a.adapter], timeoutMs: 40, retryDelayMs: 1 });
+  assert.deepEqual(await r.recover(), []);
+  assert.equal(log.map.get('tx1').state, 'COMMITTED');
+  assert.ok(!trace.some((t) => t.endsWith(':abort') || t.endsWith(':preCommit')));
+});
+
+test('run() waits for a recovery that holds the same txId', async () => {
+  const trace = [];
+  let release;
+  const held = new Promise((r) => {
+    release = r;
+  });
+  const a = makeParticipant('a', trace, {
+    hooks: {
+      abort: async (txId) => {
+        if (txId === 'tx1') await held;
+      },
+    },
+  });
+  const { c, log } = coordinator([a]);
+  await log.put({ txId: 'tx1', state: 'WAITING', payloads: { a: {} }, updatedAt: Date.now() });
+  const recovering = c.recover();
+  await sleep(1);
+  // A (misbehaving) run() for the same txId must not interleave with recovery.
+  const running = c.run('tx1', { a: {} });
+  await sleep(5);
+  assert.ok(!trace.includes('a:canCommit'));
+  release();
+  assert.deepEqual(await recovering, ['tx1']);
+  await running;
+  assert.ok(trace.indexOf('a:abort') < trace.indexOf('a:canCommit'));
+});
