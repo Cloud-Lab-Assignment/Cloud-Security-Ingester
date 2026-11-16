@@ -258,7 +258,7 @@ function cmdExport(repoRoot, service, outDir) {
   const df = [
     `# Build context is this directory. From the group repo root:`,
     `#   docker build -t ${service} services/${service}`,
-    `FROM node:22-alpine`,
+    srcDocker.find((l) => /^FROM /.test(l)) ?? 'FROM node:22-alpine',
     ``,
     `WORKDIR /app`,
     `ENV NODE_ENV=production`,
