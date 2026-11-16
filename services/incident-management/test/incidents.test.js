@@ -419,6 +419,8 @@ test('incident-db timeout sweep follows the coordinator log decision (P0-4)', { 
   assert.equal(await rows(aborted.c), 0);
   assert.equal(await rows(committed.c), 1);
   await svc.participant.abort(pending.txId);
+  // Close the coordinator entry too, so later recover() calls don't pick it up.
+  await log.put({ txId: pending.txId, state: 'ABORTED', payloads: {}, updatedAt: Date.now() });
 });
 
 test('periodic recovery finishes a transaction deferred while a participant was down (P1-2)', { skip }, async () => {
@@ -434,9 +436,10 @@ test('periodic recovery finishes a transaction deferred while a participant was 
     throw new Error('ECONNREFUSED');
   };
   const { svc } = service({ eventStore });
-  assert.deepEqual(await svc.recover(), [], 'deferred, not aborted');
   const [tx] = await createPgCoordinatorLog(db.pool).list({ correlationId: c.correlationId });
-  assert.equal(tx.state, 'PRECOMMITTED');
+  assert.ok(!(await svc.recover()).includes(tx.txId), 'deferred, not finished');
+  const [after] = await createPgCoordinatorLog(db.pool).list({ correlationId: c.correlationId });
+  assert.equal(after.state, 'PRECOMMITTED', 'deferred, not aborted');
 
   // The Event Store comes back; the loop (not a restart) finishes the transaction.
   eventStore.preCommit = realPreCommit;
