@@ -491,3 +491,50 @@ test('a new incident never takes over alerts another incident owns (P2-1)', { sk
   const owners = await db.pool.query('SELECT count(*)::int AS n FROM incident_alerts WHERE alert_id = $1', [a0]);
   assert.equal(owners.rows[0].n, 1);
 });
+
+test('postgres store commit is atomic with the business write (R2-2)', { skip }, async () => {
+  const store = createPgParticipantStore(db.pool);
+  const prepared = async () => {
+    const c = candidate();
+    const incident = mergeFor(c);
+    const txId = `r22-${c.correlationId}`;
+    const payload = { txId, correlationId: c.correlationId, kind: 'create', version: 1, incident, newAlertIds: incident.alertIds };
+    await store.put({ txId, state: 'PRECOMMITTED', payload, updatedAt: Date.now() }, { state: null });
+    return { c, txId, payload };
+  };
+  const incidentRows = async (c) =>
+    (await db.pool.query('SELECT 1 FROM incidents WHERE correlation_id = $1', [c.correlationId])).rowCount;
+  const stateOf = async (txId) => (await store.get(txId)).state;
+
+  // The timeout/abort side wins: commit must write nothing.
+  const lost = await prepared();
+  await store.put({ txId: lost.txId, state: 'ABORTED', payload: lost.payload, updatedAt: Date.now() }, { state: 'PRECOMMITTED' });
+  await assert.rejects(
+    store.commit({ txId: lost.txId, state: 'COMMITTED', payload: lost.payload, updatedAt: Date.now() }, { state: 'PRECOMMITTED' }),
+    StoreConflict,
+  );
+  assert.equal(await stateOf(lost.txId), 'ABORTED');
+  assert.equal(await incidentRows(lost.c), 0, 'no business write without COMMITTED');
+
+  // The commit side wins: business write and COMMITTED together.
+  const won = await prepared();
+  await store.commit({ txId: won.txId, state: 'COMMITTED', payload: won.payload, updatedAt: Date.now() }, { state: 'PRECOMMITTED' });
+  assert.equal(await stateOf(won.txId), 'COMMITTED');
+  assert.equal(await incidentRows(won.c), 1);
+  await assert.rejects(
+    store.put({ txId: won.txId, state: 'ABORTED', payload: won.payload, updatedAt: Date.now() }, { state: 'PRECOMMITTED' }),
+    StoreConflict,
+    'no ABORTED over a committed business write',
+  );
+
+  // Racing both sides concurrently: exactly one outcome, never a split.
+  for (let i = 0; i < 5; i += 1) {
+    const r = await prepared();
+    await Promise.allSettled([
+      store.commit({ txId: r.txId, state: 'COMMITTED', payload: r.payload, updatedAt: Date.now() }, { state: 'PRECOMMITTED' }),
+      store.put({ txId: r.txId, state: 'ABORTED', payload: r.payload, updatedAt: Date.now() }, { state: 'PRECOMMITTED' }),
+    ]);
+    const state = await stateOf(r.txId);
+    assert.equal(await incidentRows(r.c), state === 'COMMITTED' ? 1 : 0, `split: state ${state}`);
+  }
+});

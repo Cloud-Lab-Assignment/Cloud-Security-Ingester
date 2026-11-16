@@ -28,7 +28,7 @@ const iso = (d) => (d instanceof Date ? d.toISOString() : d);
 
 // ---- Durable 3PC storage in Postgres ---------------------------------------
 
-export function createPgParticipantStore(pool) {
+export function createPgParticipantStore(pool, { now = Date.now } = {}) {
   const toRecord = (r) => ({ txId: r.tx_id, state: r.state, payload: r.payload, updatedAt: Number(r.updated_ms) });
   const cols = 'tx_id, state, payload, (extract(epoch from updated_at) * 1000)::bigint AS updated_ms';
   return {
@@ -66,6 +66,20 @@ export function createPgParticipantStore(pool) {
         `SELECT ${cols} FROM tpc_participant WHERE state IN ('UNCERTAIN', 'PRECOMMITTED') ORDER BY updated_at`,
       );
       return rows.map(toRecord);
+    },
+    // Atomic commit (R2-2): the state transition to COMMITTED and the incident
+    // write happen in ONE Postgres transaction. The conditional UPDATE runs
+    // first and row-locks the record, so a concurrent abort either already won
+    // (0 rows: nothing is written) or waits and then fails its own condition.
+    async commit({ txId, state, payload, updatedAt }, expected) {
+      await withTransaction(pool, async (db) => {
+        const res = await db.query(
+          `UPDATE tpc_participant SET state = $2, payload = $3, updated_at = $4 WHERE tx_id = $1 AND state = $5`,
+          [txId, state, payload == null ? null : JSON.stringify(payload), new Date(updatedAt), expected.state],
+        );
+        if (res.rowCount === 0) throw new StoreConflict(txId, expected.state);
+        await applyDecisionIn(db, { ...payload, txId }, now);
+      });
     },
   };
 }
@@ -162,56 +176,59 @@ export function createEventStoreParticipant({ baseUrl, timeoutMs, fetch: fetchIm
 
 // Apply one decided correlation decision in a single Postgres transaction.
 // Idempotent per txId (a history row with that tx_id means it already ran).
-export async function applyDecision(pool, { txId, kind, version, incident, newAlertIds }, now = Date.now) {
-  await withTransaction(pool, async (db) => {
-    const done = await db.query('SELECT 1 FROM incident_history WHERE tx_id = $1', [txId]);
-    if (done.rowCount > 0) return;
-    const i = incident;
-    if (kind === 'create') {
-      await db.query(
-        `INSERT INTO incidents (incident_id, correlation_id, entity_key, title, severity, status, alert_count,
-           event_count, rule_ids, related_event_ids, entity, enrichment, first_seen, last_seen, version, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,'open',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
-        [
-          i.incidentId, i.correlationId, i.entityKey, i.title, i.severity, i.alertCount, i.eventCount,
-          i.ruleIds, i.relatedEventIds, JSON.stringify(i.entity ?? null), JSON.stringify(i.enrichment ?? null),
-          i.firstSeen, i.lastSeen, version, i.createdAt, i.updatedAt,
-        ],
-      );
-    } else {
-      // Never touches status: analyst status changes are separate local updates.
-      const res = await db.query(
-        `UPDATE incidents SET title = $3, severity = $4, alert_count = $5, event_count = $6, rule_ids = $7,
-           related_event_ids = $8, entity = $9, enrichment = $10, first_seen = $11, last_seen = $12,
-           version = $2, updated_at = $13
-         WHERE incident_id = $1 AND version = $2 - 1`,
-        [
-          i.incidentId, version, i.title, i.severity, i.alertCount, i.eventCount, i.ruleIds, i.relatedEventIds,
-          JSON.stringify(i.entity ?? null), JSON.stringify(i.enrichment ?? null), i.firstSeen, i.lastSeen, i.updatedAt,
-        ],
-      );
-      if (res.rowCount === 0) throw new StaleVersion(i.incidentId, version);
-    }
-    for (const alertId of newAlertIds) {
-      await db.query('INSERT INTO incident_alerts (incident_id, alert_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [
-        i.incidentId,
-        alertId,
-      ]);
-    }
-    await db.query('INSERT INTO incident_history (incident_id, tx_id, change, actor, at) VALUES ($1, $2, $3, $4, $5)', [
+export async function applyDecision(pool, payload, now = Date.now) {
+  await withTransaction(pool, (db) => applyDecisionIn(db, payload, now));
+}
+
+// The same, inside a caller's transaction (`db` is a client with BEGIN issued).
+export async function applyDecisionIn(db, { txId, kind, version, incident, newAlertIds }, now = Date.now) {
+  const done = await db.query('SELECT 1 FROM incident_history WHERE tx_id = $1', [txId]);
+  if (done.rowCount > 0) return;
+  const i = incident;
+  if (kind === 'create') {
+    await db.query(
+      `INSERT INTO incidents (incident_id, correlation_id, entity_key, title, severity, status, alert_count,
+         event_count, rule_ids, related_event_ids, entity, enrichment, first_seen, last_seen, version, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,'open',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+      [
+        i.incidentId, i.correlationId, i.entityKey, i.title, i.severity, i.alertCount, i.eventCount,
+        i.ruleIds, i.relatedEventIds, JSON.stringify(i.entity ?? null), JSON.stringify(i.enrichment ?? null),
+        i.firstSeen, i.lastSeen, version, i.createdAt, i.updatedAt,
+      ],
+    );
+  } else {
+    // Never touches status: analyst status changes are separate local updates.
+    const res = await db.query(
+      `UPDATE incidents SET title = $3, severity = $4, alert_count = $5, event_count = $6, rule_ids = $7,
+         related_event_ids = $8, entity = $9, enrichment = $10, first_seen = $11, last_seen = $12,
+         version = $2, updated_at = $13
+       WHERE incident_id = $1 AND version = $2 - 1`,
+      [
+        i.incidentId, version, i.title, i.severity, i.alertCount, i.eventCount, i.ruleIds, i.relatedEventIds,
+        JSON.stringify(i.entity ?? null), JSON.stringify(i.enrichment ?? null), i.firstSeen, i.lastSeen, i.updatedAt,
+      ],
+    );
+    if (res.rowCount === 0) throw new StaleVersion(i.incidentId, version);
+  }
+  for (const alertId of newAlertIds) {
+    await db.query('INSERT INTO incident_alerts (incident_id, alert_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [
       i.incidentId,
-      txId,
-      JSON.stringify({ kind, version, severity: i.severity, newAlertIds }),
-      'correlation-engine',
-      new Date(now()),
+      alertId,
     ]);
-    // Queue incident-updates in the same transaction (P1-3): if this commits,
-    // the message is published eventually, whoever drove the commit.
-    const { rows } = await db.query('SELECT * FROM incidents WHERE incident_id = $1', [i.incidentId]);
-    const alerts = await db.query('SELECT alert_id FROM incident_alerts WHERE incident_id = $1 ORDER BY alert_id', [i.incidentId]);
-    const snapshot = rowToIncident(rows[0], alerts.rows.map((r) => r.alert_id));
-    await enqueueIncidentUpdate(db, kind === 'create' ? 'incident.created' : 'incident.updated', snapshot, now, txId);
-  });
+  }
+  await db.query('INSERT INTO incident_history (incident_id, tx_id, change, actor, at) VALUES ($1, $2, $3, $4, $5)', [
+    i.incidentId,
+    txId,
+    JSON.stringify({ kind, version, severity: i.severity, newAlertIds }),
+    'correlation-engine',
+    new Date(now()),
+  ]);
+  // Queue incident-updates in the same transaction (P1-3): if this commits,
+  // the message is published eventually, whoever drove the commit.
+  const { rows } = await db.query('SELECT * FROM incidents WHERE incident_id = $1', [i.incidentId]);
+  const alerts = await db.query('SELECT alert_id FROM incident_alerts WHERE incident_id = $1 ORDER BY alert_id', [i.incidentId]);
+  const snapshot = rowToIncident(rows[0], alerts.rows.map((r) => r.alert_id));
+  await enqueueIncidentUpdate(db, kind === 'create' ? 'incident.created' : 'incident.updated', snapshot, now, txId);
 }
 
 // Vote yes only if the decision still applies cleanly: no other in-flight
@@ -252,7 +269,7 @@ export async function lockCorrelation(db, correlationId) {
 // ABORTED) in ONE Postgres transaction under the correlation's advisory lock,
 // so a PATCH can never slip in between "validated" and "reserved" (P0-2).
 export function createIncidentDbParticipant({ pool, timeoutMs, now = Date.now, hooks = {}, resolve }) {
-  const store = createPgParticipantStore(pool);
+  const store = createPgParticipantStore(pool, { now });
   const sm = createParticipant({
     store,
     timeoutMs,
