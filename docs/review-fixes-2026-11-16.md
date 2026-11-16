@@ -153,3 +153,34 @@ Three independent reviews of `main@d5f34c9` (GPT-6.1 Sol: 3PC correctness, data 
 ## Done log
 
 <!-- The box agent appends: item ID, commit SHA, test evidence. -->
+
+### 16 Nov 2026 (box agent)
+
+All P0 and P1 items are done; P2 items are done except P2-2 (documented as a known limit). One commit per item unless noted. Each behaviour fix had a test that failed on the old code first.
+
+| Item | Commit(s) | Test evidence |
+|---|---|---|
+| P0-1 | `afed2fc` | `bash scripts/demo-3pc.sh` passes on the rebuilt stack (output in `docs/handoff.md`); interrupted with SIGINT while `TPC_FORCE_VOTE=no` was active, the trap restored event-store (`TPC_FORCE_VOTE=` empty). No `date -d`, `/proc` or `$RANDOM`. |
+| P0-2 | `a136d41` | `PATCH racing a 3PC update never leaves a decided commit unapplied (P0-2)`: failed (stuck PRECOMMITTED) before, passes after. |
+| P0-3 | `1152f0e` (tpc + DynamoDB), `fbe2028` (Postgres store) | Five two-replica `race:` tests in tpc, DynamoDB Local test `two replicas on one table: a stale sweep-abort cannot overwrite PRECOMMITTED`, `postgres participant store honours expected-state writes (P0-3)`. |
+| P0-4 | `baf8413` (tpc + event-store client), `ec14476` (coordinator route + local participant), `c927363` (compose), `1e306e3` (design doc) | Case (a) tests in tpc and in incident-management (`incident-db timeout sweep follows the coordinator log decision`), route test for `GET /tpc/transactions/:txId`; demo scenario 3 shows the fallback self-commit while the coordinator is down. |
+| P0-5 | `b186d6a` | `TODO(Rishit): ID number` left for Rishit. |
+| P1-1 | `cb4b0ce` | `retries give up after 5 attempts…` (now stays PRECOMMITTED) and `a later recover() finishes a commit whose doCommit was unacked`. |
+| P1-2 | `b642136` (coordinator), `88ae4c3` + `ca3e053` (15 s loop, test isolation) | `recover() skips a transaction that run() is still driving`, `concurrent recover() calls do not overlap`, `periodic recovery finishes a transaction deferred while a participant was down (P1-2)`. |
+| P1-3 | `5547b53` | Outbox rows checked in the upsert/status tests; `relay publishes outbox rows in id order…`, `relay keeps rows when Kafka fails…`; e2e (d) still sees `incident.created` then `incident.updated`. |
+| P1-4 | `fc3c6c8` | 19 wrong-typed alert fields skipped without throwing, correlator unchanged; throwing `ingest()` skipped. |
+| P1-5 | `b34eae1` | `readiness follows the kafkajs consumer group state` (CRASH then GROUP_JOIN → ready again). |
+| P1-6 | `634e0e1` | `findTarget fallback ignores an incident from a different window (P1-6)`. |
+| P1-7 | `8030d8a` (+ `fea5ad9` keeps the pinned FROM) | Re-run on the final code: each exported service passes `npm ci && npm test` (52 / 24 / 32), builds with its own directory as context, no `@core/` left. Lockfiles generated with `npm install --package-lock-only` (approved by Rishit). |
+| P1-8 | `d3e67cd` (code), `113895a` (handoff) | Bounded run with Kafka unreachable: `/health` 200 and `/ready` 503 while starting (was connection refused). |
+| P1-9 | `1e306e3` | Deployment diagram added. It uses only the Mermaid constructs that rendered in the architecture diagram; not re-rendered with the Mermaid CLI (it was removed, and installing it again needs approval). |
+| P2-1 | `a6231e9` | `redelivered alert after restart + resolve is a noop…`, `a new incident never takes over alerts another incident owns`. Migration `003_alert_unique.sql`. |
+| P2-2 | not done | Needs a per-alert summary in the gRPC request and `incident_alerts`; documented under Known limits in the design doc. |
+| P2-3 | `d61d67c` | Keys over 1024 UTF-8 bytes stored as `h:` + sha256; DynamoDB Local rejected them before. |
+| P2-4 | `1ba50ae` | Stuck DynamoDB/S3 calls fail in < 3 s against a socket that never answers (needed `throwOnRequestTimeout`); heartbeat-order test. |
+| P2-5 | `e5a5b66` | Eviction tests (groups closed > 2 windows ago, watermark capped at now + window). |
+| P2-6 | `35d9e26` | Malformed and foreign cursors return 400. |
+| P2-7 | `fea5ad9` | Images build with digest-pinned `FROM`; a deliberately wrong `--checksum` fails the build (`digest mismatch`). |
+| P2-8 | `bd2d1bc` | Fixtures validated against the upstream JSON schemas (`userType: "human"`). |
+
+Final run on `113895a`: `npm test` 175/175 (common 10, tpc 57, event-store 52, incident-management 24, correlation-engine 32); `INTEGRATION=1 npm test -w event-store -w incident-management` 65/65 and 48/48; `npm run test:integration` 2/2 (twice) and `scripts/demo-3pc.sh` exit 0 on `docker compose up -d --build`.
