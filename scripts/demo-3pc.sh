@@ -98,6 +98,20 @@ show_correlation() {
   curl -fsS "$ES/correlations/$(uri "$1")" | jq -c '.versions[] | {version, kind: .decision.kind, txId: .txId[0:8], recordedAt}'
 }
 
+# Phase 3 is done only when the coordinator logged the newest transaction for
+# the correlation COMMITTED *and* the Event Store serves that version (R3-8);
+# the Postgres incident row alone can appear first.
+wait_committed() {
+  local corr=$1 version=${2:-1} i state have
+  for i in $(seq 1 60); do
+    state=$(curl -fsS "$IM/tpc/transactions?limit=1&correlationId=$(uri "$corr")" | jq -r '.items[0].state // empty')
+    have=$(curl -fsS "$ES/correlations/$(uri "$corr")" 2>/dev/null | jq --argjson v "$version" '[.versions[]? | select(.version == $v)] | length' 2>/dev/null || echo 0)
+    if [ "$state" = COMMITTED ] && [ "${have:-0}" -ge 1 ]; then return 0; fi
+    sleep 1
+  done
+  fail "transaction for $corr (version $version) did not finish committing on both sides"
+}
+
 wait_incident() {
   local entity=$1 i
   for i in $(seq 1 60); do
@@ -118,6 +132,7 @@ note "sent alert ${A1:0:40}…"
 wait_incident "$E1"
 show_incident "$E1"
 CORR1=$(incidents_for "$E1" | jq -r '.items[0].correlationId')
+wait_committed "$CORR1" 1
 note "coordinator log for $CORR1:"
 show_tx "$CORR1"
 note "event-store correlation history:"
@@ -148,6 +163,7 @@ note "restoring event-store (votes normally); the engine's retry now commits"
 docker compose up -d event-store >/dev/null 2>&1
 wait_healthy event-store
 wait_incident "$E2"
+wait_committed "$CORR2" 1
 show_incident "$E2"
 show_tx "$CORR2" | tail -2
 
@@ -193,6 +209,7 @@ docker compose up -d incident-management >/dev/null 2>&1
 wait_healthy incident-management
 docker compose logs --no-color --tail 80 incident-management 2>/dev/null | grep -o '"recovered":\[[^]]*\]' | tail -1 | sed 's/^/    /'
 wait_incident "$E3"
+wait_committed "$CORR3" 1
 show_incident "$E3"
 show_tx "$CORR3"
 
