@@ -98,7 +98,7 @@ function normalizedEvent(eventId, entityKey, t) {
     category: 'authentication',
     action: 'login',
     outcome: 'failure',
-    actor: { userId: 'alice', userName: 'alice', userType: 'user' },
+    actor: { userId: 'alice', userName: 'alice', userType: 'human' },
     network: { srcIp: entityKey, srcPort: 50000, dstIp: '10.0.0.5', dstPort: 22, protocol: 'tcp' },
     target: { resourceType: 'host', resourceId: 'bastion-1' },
     source: { type: 'auth', name: 'e2e-sshd', host: 'bastion-1' },
