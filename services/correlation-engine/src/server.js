@@ -14,7 +14,7 @@ let consumerHandle = null;
 const app = buildApp({
   service: SERVICE,
   logger,
-  ready: async () => consumerHandle?.isConnected() ?? false,
+  ready: async () => consumerHandle?.isReady() ?? false,
 });
 
 const metrics = createMetrics(app.metrics);

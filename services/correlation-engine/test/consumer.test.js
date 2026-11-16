@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import client from 'prom-client';
 import { status as grpcStatus } from '@grpc/grpc-js';
 import { createCorrelator } from '../src/correlator.js';
-import { handleAlert, createMetrics } from '../src/consumer.js';
+import { handleAlert, createMetrics, startConsumer } from '../src/consumer.js';
 import { makeAlert, toMessage, silentLogger } from './fixtures.js';
 
 function grpcError(code, message = 'boom') {
@@ -194,4 +195,54 @@ test('invalid alerts are logged at warn with topic, partition and offset', async
   assert.equal(warnings[0].obj.partition, 2);
   assert.equal(warnings[0].obj.offset, '17');
   assert.match(warnings[0].obj.reason, /window/);
+});
+
+// A kafkajs-like consumer that lets the test emit instrumentation events.
+function fakeKafka() {
+  const emitter = new EventEmitter();
+  const consumer = {
+    events: {
+      CONNECT: 'consumer.connect',
+      GROUP_JOIN: 'consumer.group_join',
+      CRASH: 'consumer.crash',
+      STOP: 'consumer.stop',
+      DISCONNECT: 'consumer.disconnect',
+    },
+    on: (event, listener) => {
+      emitter.on(event, listener);
+      return () => emitter.off(event, listener);
+    },
+    connect: async () => emitter.emit('consumer.connect', { type: 'consumer.connect', payload: null }),
+    subscribe: async () => {},
+    run: async () => {},
+    disconnect: async () => emitter.emit('consumer.disconnect', { type: 'consumer.disconnect', payload: null }),
+  };
+  const emit = (name, payload = {}) => emitter.emit(consumer.events[name], { type: consumer.events[name], payload });
+  return { kafka: { consumer: () => consumer }, emit };
+}
+
+test('readiness follows the kafkajs consumer group state', async () => {
+  const { kafka, emit } = fakeKafka();
+  const handle = await startConsumer({ kafka, logger: silentLogger, topic: 'security-alerts', groupId: 'g', handle: async () => {} });
+  // connected but not yet in the group
+  assert.equal(handle.isReady(), false);
+  emit('GROUP_JOIN');
+  assert.equal(handle.isReady(), true);
+  emit('CRASH', { error: new Error('boom'), restart: true });
+  assert.equal(handle.isReady(), false);
+  // kafkajs restarts the consumer, which rejoins the group
+  emit('GROUP_JOIN');
+  assert.equal(handle.isReady(), true);
+  emit('STOP');
+  assert.equal(handle.isReady(), false);
+  emit('GROUP_JOIN');
+  emit('DISCONNECT');
+  assert.equal(handle.isReady(), false);
+  emit('GROUP_JOIN');
+  assert.equal(handle.isReady(), true);
+  // after stop() a late GROUP_JOIN does not make it ready again
+  await handle.stop();
+  assert.equal(handle.isReady(), false);
+  emit('GROUP_JOIN');
+  assert.equal(handle.isReady(), false);
 });

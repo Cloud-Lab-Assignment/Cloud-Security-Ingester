@@ -149,15 +149,23 @@ export async function handleAlert(message, deps, where = {}) {
 // Subscribe to the alert topic and feed every message through `handle`.
 // kafkajs runs partitions concurrently but each partition serially; alerts are
 // keyed by entityKey, so one entity's correlator state is never raced.
+//
+// isReady() is true only while the consumer is in its group: set on
+// GROUP_JOIN, cleared on CRASH, STOP and DISCONNECT. When kafkajs restarts
+// after a retriable crash it rejoins and GROUP_JOIN makes it ready again;
+// after stop() it stays false.
 export async function startConsumer({ kafka, logger, topic, groupId, handle }) {
   const consumer = kafka.consumer({ groupId });
-  let connected = false;
-  consumer.on(consumer.events.CONNECT, () => { connected = true; });
-  consumer.on(consumer.events.DISCONNECT, () => { connected = false; });
-  consumer.on(consumer.events.CRASH, ({ payload }) => {
-    connected = false;
+  let ready = false;
+  let stopped = false;
+  const { GROUP_JOIN, CRASH, STOP, DISCONNECT } = consumer.events;
+  consumer.on(GROUP_JOIN, () => { ready = true; });
+  consumer.on(CRASH, ({ payload } = {}) => {
+    ready = false;
     logger.error({ err: payload?.error, restart: payload?.restart }, 'kafka consumer crashed');
   });
+  consumer.on(STOP, () => { ready = false; });
+  consumer.on(DISCONNECT, () => { ready = false; });
 
   await consumer.connect();
   await consumer.subscribe({ topic, fromBeginning: true });
@@ -168,7 +176,11 @@ export async function startConsumer({ kafka, logger, topic, groupId, handle }) {
 
   return {
     consumer,
-    isConnected: () => connected,
-    stop: () => consumer.disconnect(),
+    isReady: () => ready && !stopped,
+    stop: async () => {
+      stopped = true;
+      ready = false;
+      await consumer.disconnect();
+    },
   };
 }
