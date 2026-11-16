@@ -295,13 +295,48 @@ test('doCommit is retried until acked', async () => {
 test('retries give up after 5 attempts without throwing', async () => {
   const trace = [];
   const a = makeParticipant('a', trace, { hooks: { doCommit: async () => { throw new Error('down'); } } });
-  const { c, log } = coordinator([a]);
+  const { c, log, committed } = coordinator([a]);
   const res = await c.run('tx1', { a: {} });
-  // The decision is final once every participant pre-committed; a missed
-  // doCommit is covered by the participant's own PRECOMMITTED timeout.
-  assert.equal(res.outcome, 'committed');
+  // The decision is final once every participant pre-committed, so the caller
+  // still sees "committed". But the unacked doCommit keeps the log entry
+  // PRECOMMITTED and onCommitted is not called until recover() finishes it.
+  assert.deepEqual(res, { outcome: 'committed', pending: ['a'] });
   assert.equal(trace.filter((t) => t === 'a:doCommit').length, 5);
+  assert.equal(log.map.get('tx1').state, 'PRECOMMITTED');
+  assert.equal(committed.length, 0);
+  assert.equal(await a.state('tx1'), 'PRECOMMITTED');
+});
+
+test('a later recover() finishes a commit whose doCommit was unacked', async () => {
+  const trace = [];
+  let down = true;
+  const a = makeParticipant('a', trace, {
+    hooks: {
+      doCommit: async () => {
+        if (down) throw new Error('down');
+      },
+    },
+  });
+  const b = makeParticipant('b', trace);
+  const { c, log, committed } = coordinator([a, b]);
+  const res = await c.run('tx1', payloads);
+  assert.deepEqual(res, { outcome: 'committed', pending: ['a'] });
+  assert.equal(await b.state('tx1'), 'COMMITTED');
+  assert.equal(committed.length, 0);
+
+  // Still unreachable: recovery leaves it unfinished.
+  assert.deepEqual(await c.recover(), []);
+  assert.equal(log.map.get('tx1').state, 'PRECOMMITTED');
+  assert.equal(committed.length, 0);
+
+  down = false;
+  assert.deepEqual(await c.recover(), ['tx1']);
   assert.equal(log.map.get('tx1').state, 'COMMITTED');
+  assert.equal(await a.state('tx1'), 'COMMITTED');
+  assert.deepEqual(committed, [{ txId: 'tx1', payloads }]);
+  assert.equal(a.applied.length, 1);
+  assert.equal(b.applied.length, 1);
+  assert.deepEqual(await c.recover(), []);
 });
 
 test('TpcStateError carries the participant state', () => {

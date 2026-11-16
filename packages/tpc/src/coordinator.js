@@ -66,8 +66,15 @@ export function createCoordinator({
     return { outcome: 'aborted', reason };
   }
 
+  // The decision is commit. If any participant never acked doCommit, the log
+  // entry stays PRECOMMITTED and onCommitted waits: recover() replays it later
+  // (the participant's own PRECOMMITTED timeout also commits it meanwhile).
   async function commitAll(txId, payloads) {
-    await sendWithRetry(txId, 'doCommit');
+    const pending = await sendWithRetry(txId, 'doCommit');
+    if (pending.length) {
+      logger?.warn({ txId, pending }, '3pc commit decided but not acknowledged; recovery will finish it');
+      return { outcome: 'committed', pending };
+    }
     await write(txId, 'COMMITTED', payloads);
     logger?.info({ txId }, '3pc committed');
     if (onCommitted) await onCommitted(txId, payloads);
@@ -154,7 +161,8 @@ export function createCoordinator({
         logger?.warn({ txId }, '3pc recovery deferred: participant unreachable');
         continue;
       } else {
-        await commitAll(txId, payloads);
+        const res = await commitAll(txId, payloads);
+        if (res.pending) continue; // still unacked: stays PRECOMMITTED for the next recover()
       }
       finished.push(txId);
     }
