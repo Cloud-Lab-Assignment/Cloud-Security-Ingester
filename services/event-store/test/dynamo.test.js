@@ -8,6 +8,7 @@ import {
   encodeCursor,
   decodeCursor,
   tableNames,
+  InvalidCursorError,
 } from '../src/dynamo.js';
 import { ensureLocalResources } from '../src/local-setup.js';
 import { StoreConflict, TpcStateError } from '@core/tpc';
@@ -25,6 +26,15 @@ test('invalid cursor throws', () => {
   assert.throws(() => decodeCursor('not-a-cursor!'), /cursor/);
   assert.throws(() => decodeCursor(Buffer.from('[1,2]').toString('base64url')), /cursor/);
   assert.throws(() => decodeCursor(Buffer.from('"x"').toString('base64url')), /cursor/);
+});
+
+test('cursor must be exactly string {entityKey, sk}, for the expected entity', () => {
+  const sk = '2026-11-16T05:00:00.000Z#abc';
+  for (const key of [{ a: 1 }, { entityKey: 'x' }, { entityKey: 'x', sk: 1 }, { entityKey: 'x', sk, more: 'y' }]) {
+    assert.throws(() => decodeCursor(encodeCursor(key)), InvalidCursorError, JSON.stringify(key));
+  }
+  assert.throws(() => decodeCursor(encodeCursor({ entityKey: 'y', sk }), 'x'), InvalidCursorError);
+  assert.deepEqual(decodeCursor(encodeCursor({ sk, entityKey: 'x' }), 'x'), { entityKey: 'x', sk });
 });
 
 test('tableNames uses the prefix', () => {
@@ -118,6 +128,8 @@ describe('dynamodb repo (integration)', { skip: !process.env.INTEGRATION }, () =
     assert.equal(page2.items.length, 1);
     assert.equal(page2.nextCursor, null);
     assert.equal(page2.items[0].eventTime, '2026-11-16T05:02:00.000Z');
+    // Another entity's cursor is rejected before it reaches DynamoDB.
+    await assert.rejects(repo.queryEvents({ ...q, entityKey: `k-${randomUUID()}`, cursor: page1.nextCursor }), InvalidCursorError);
   });
 
   test('putCorrelation stores versions once, getCorrelation orders by version', async () => {

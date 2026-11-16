@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildServer } from '../src/routes.js';
 import { createCorrelationParticipant, validateCorrelationPayload } from '../src/participant.js';
-import { encodeCursor } from '../src/dynamo.js';
+import { encodeCursor, InvalidCursorError } from '../src/dynamo.js';
 import { fakeRepo, normalizedEvent, correlationPayload } from './helpers.js';
 
 const NOW = Date.parse('2026-11-16T06:00:00.000Z');
@@ -110,6 +110,37 @@ test('GET /events rejects bad from/to/limit/cursor (400)', async () => {
     assert.equal(typeof res.json().message, 'string', qs);
   }
   assert.equal(repo.calls.queryEvents.length, 0);
+});
+
+test('GET /events rejects cursors that are not exactly {entityKey, sk} for this entity (400)', async () => {
+  const { app, repo } = setup();
+  const sk = '2026-11-16T05:10:00.000Z#e';
+  const cursors = [
+    { a: 1 },
+    { entityKey: 'x' },
+    { sk },
+    { entityKey: 'x', sk: 5 },
+    { entityKey: 1, sk },
+    { entityKey: 'x', sk, extra: 'z' },
+    { entityKey: 'y', sk }, // another entity's cursor
+    {},
+  ];
+  for (const key of cursors) {
+    const res = await app.inject(`/events?entityKey=x&cursor=${encodeCursor(key)}`);
+    assert.equal(res.statusCode, 400, JSON.stringify(key));
+    assert.equal(res.json().error, 'bad_request');
+  }
+  assert.equal(repo.calls.queryEvents.length, 0);
+});
+
+test('GET /events maps an InvalidCursorError from the repo to 400', async () => {
+  const { app, repo } = setup();
+  repo.queryEvents = async () => {
+    throw new InvalidCursorError();
+  };
+  const cursor = encodeCursor({ entityKey: 'x', sk: '2026-11-16T05:10:00.000Z#e' });
+  const res = await app.inject(`/events?entityKey=x&cursor=${cursor}`);
+  assert.equal(res.statusCode, 400);
 });
 
 test('GET /events passes a valid cursor through', async () => {

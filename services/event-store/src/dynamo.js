@@ -27,12 +27,14 @@ export class InvalidCursorError extends Error {
   }
 }
 
-// Cursor = base64url(JSON(LastEvaluatedKey)).
+// Cursor = base64url(JSON(LastEvaluatedKey)) of the events table, i.e. exactly
+// {entityKey, sk} as strings. When `entityKey` is given, the cursor must belong
+// to that entity (a cursor from another query is rejected, not followed).
 export function encodeCursor(lastEvaluatedKey) {
   return Buffer.from(JSON.stringify(lastEvaluatedKey)).toString('base64url');
 }
 
-export function decodeCursor(cursor) {
+export function decodeCursor(cursor, entityKey) {
   if (typeof cursor !== 'string' || !/^[A-Za-z0-9_-]+$/.test(cursor)) throw new InvalidCursorError();
   let key;
   try {
@@ -41,10 +43,13 @@ export function decodeCursor(cursor) {
     throw new InvalidCursorError();
   }
   if (key === null || typeof key !== 'object' || Array.isArray(key)) throw new InvalidCursorError();
-  for (const v of Object.values(key)) {
-    if (typeof v !== 'string' && typeof v !== 'number') throw new InvalidCursorError();
+  const fields = Object.keys(key).sort();
+  if (fields.length !== 2 || fields[0] !== 'entityKey' || fields[1] !== 'sk') throw new InvalidCursorError();
+  if (typeof key.entityKey !== 'string' || typeof key.sk !== 'string') throw new InvalidCursorError();
+  if (entityKey !== undefined && key.entityKey !== entityKey) {
+    throw new InvalidCursorError('cursor belongs to another entityKey');
   }
-  return key;
+  return { entityKey: key.entityKey, sk: key.sk };
 }
 
 const isConditionFailure = (err) => err?.name === 'ConditionalCheckFailedException';
@@ -121,7 +126,7 @@ export function createDynamoRepo({ doc, tablePrefix }) {
         },
         Limit: limit,
         ScanIndexForward: true,
-        ...(cursor ? { ExclusiveStartKey: decodeCursor(cursor) } : {}),
+        ...(cursor ? { ExclusiveStartKey: decodeCursor(cursor, entityKey) } : {}),
       }),
     );
     return {

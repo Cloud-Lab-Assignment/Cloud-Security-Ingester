@@ -1,7 +1,7 @@
 import client from 'prom-client';
 import { buildApp, isIsoTimestamp, isoTimestamp } from '@core/common';
 import { TpcStateError } from '@core/tpc';
-import { decodeCursor } from './dynamo.js';
+import { decodeCursor, InvalidCursorError } from './dynamo.js';
 import { SERVICE_NAME } from './config.js';
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -31,7 +31,7 @@ function parseEventsQuery(q, now) {
   }
   if (cursor !== undefined) {
     try {
-      decodeCursor(cursor);
+      decodeCursor(cursor, entityKey);
     } catch {
       return { error: 'cursor is invalid' };
     }
@@ -58,8 +58,13 @@ export function registerRoutes(app, { repo, participant, now = Date.now }) {
   app.get('/events', async (request, reply) => {
     const { query, error } = parseEventsQuery(request.query ?? {}, now);
     if (error) return badRequest(reply, error);
-    const { items, nextCursor } = await repo.queryEvents(query);
-    return { items, nextCursor };
+    try {
+      const { items, nextCursor } = await repo.queryEvents(query);
+      return { items, nextCursor };
+    } catch (err) {
+      if (err instanceof InvalidCursorError) return badRequest(reply, 'cursor is invalid');
+      throw err;
+    }
   });
 
   app.get('/correlations/:correlationId', async (request, reply) => {
