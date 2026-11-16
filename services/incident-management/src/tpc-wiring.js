@@ -98,6 +98,10 @@ export function createPgCoordinatorLog(pool) {
       );
       return rows.map(toEntry);
     },
+    async get(txId) {
+      const { rows } = await pool.query('SELECT * FROM tpc_coordinator WHERE tx_id = $1', [txId]);
+      return rows[0] ? toEntry(rows[0]) : null;
+    },
     // Latest transactions, newest first (for GET /tpc/transactions).
     async list({ limit = 20, correlationId } = {}) {
       const params = [];
@@ -230,6 +234,15 @@ export async function validateDecision(db, txId, payload) {
   return rows.length === 1 && rows[0].version === payload.version - 1;
 }
 
+// Map a coordinator log entry to the participant's resolve() answer (P0-4):
+// a final decision, PENDING while the coordinator is still driving or
+// recovering it, or null (unknown) so the participant's timeout rule applies.
+export function decisionOf(entry) {
+  if (!entry) return null;
+  if (entry.state === 'COMMITTED' || entry.state === 'ABORTED') return entry.state;
+  return 'PENDING';
+}
+
 // Per-incident serialisation shared by the 3PC vote and analyst PATCHes.
 export async function lockCorrelation(db, correlationId) {
   await db.query('SELECT pg_advisory_xact_lock(hashtext($1))', [correlationId]);
@@ -238,12 +251,15 @@ export async function lockCorrelation(db, correlationId) {
 // The incident-db participant. Its vote validates and records UNCERTAIN (or
 // ABORTED) in ONE Postgres transaction under the correlation's advisory lock,
 // so a PATCH can never slip in between "validated" and "reserved" (P0-2).
-export function createIncidentDbParticipant({ pool, timeoutMs, now = Date.now, hooks = {} }) {
+export function createIncidentDbParticipant({ pool, timeoutMs, now = Date.now, hooks = {}, resolve }) {
   const store = createPgParticipantStore(pool);
   const sm = createParticipant({
     store,
     timeoutMs,
     now,
+    // Before acting on a timeout, ask the coordinator log (same process) for
+    // the decision; only fall back to the timeout rule when there is none.
+    resolve,
     // Only reached when reserve() did not record a vote (malformed payload).
     validate: (txId, payload) => validateDecision(pool, txId, payload),
     apply: (payload) => applyDecision(pool, payload, now),
@@ -299,7 +315,14 @@ export function createIncidentService({
   now = Date.now,
   participantHooks,
 }) {
-  const local = createIncidentDbParticipant({ pool, timeoutMs: config.tpcParticipantTimeoutMs, now, hooks: participantHooks });
+  const coordinatorLog = createPgCoordinatorLog(pool);
+  const local = createIncidentDbParticipant({
+    pool,
+    timeoutMs: config.tpcParticipantTimeoutMs,
+    now,
+    hooks: participantHooks,
+    resolve: async (txId) => decisionOf(await coordinatorLog.get(txId)),
+  });
 
   // incident-updates is queued by applyDecision in the outbox, so a commit
   // only needs counting here.
@@ -308,7 +331,7 @@ export function createIncidentService({
   }
 
   const coordinator = createCoordinator({
-    log: createPgCoordinatorLog(pool),
+    log: coordinatorLog,
     participants: [local, eventStore],
     timeoutMs: config.tpcTimeoutMs,
     now,

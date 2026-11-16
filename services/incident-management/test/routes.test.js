@@ -27,6 +27,9 @@ function setup(repoOver = {}) {
     ...repoOver,
   };
   const coordinatorLog = {
+    async get(txId) {
+      return txId === 'tx|1' ? { txId, state: 'ABORTED', reason: 'vote_no' } : null;
+    },
     async list(q) {
       calls.tx.push(q);
       return [{ txId: 't1', state: 'COMMITTED' }];
@@ -120,4 +123,15 @@ test('GET /tpc/transactions passes limit and correlationId', async (t) => {
   assert.equal(res.statusCode, 200);
   assert.deepEqual(res.json(), { items: [{ txId: 't1', state: 'COMMITTED' }] });
   assert.deepEqual(calls.tx[0], { limit: 5, correlationId: 'cor-|x' });
+});
+
+test('GET /tpc/transactions/:txId returns the coordinator decision or 404 (P0-4)', async (t) => {
+  const { app } = setup();
+  t.after(() => app.close());
+  const res = await app.inject({ method: 'GET', url: '/tpc/transactions/tx%7C1' });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.json(), { txId: 'tx|1', state: 'ABORTED', reason: 'vote_no' });
+  const missing = await app.inject({ method: 'GET', url: '/tpc/transactions/nope' });
+  assert.equal(missing.statusCode, 404);
+  assert.deepEqual(missing.json(), { error: 'not_found' });
 });

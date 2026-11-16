@@ -2,7 +2,9 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { CoordinatorCrash, StoreConflict } from '@core/tpc';
 import { migrate } from '../src/migrate.js';
-import { createIncidentRepo, VersionConflict, TransactionPending } from '../src/incidents.js';
+import { createIncidentRepo, VersionConflict, TransactionPending, mergeCandidate } from '../src/incidents.js';
+
+const mergeFor = (c) => mergeCandidate(null, new Set(), c).incident;
 import {
   createIncidentService,
   createPgCoordinatorLog,
@@ -380,4 +382,41 @@ test('postgres participant store honours expected-state writes (P0-3)', { skip }
   assert.equal((await store.get(txId)).state, 'PRECOMMITTED');
   await store.put(rec('COMMITTED')); // no expectation: unconditional
   assert.equal((await store.get(txId)).state, 'COMMITTED');
+});
+
+test('incident-db timeout sweep follows the coordinator log decision (P0-4)', { skip }, async () => {
+  const { svc } = service({ config: { tpcParticipantTimeoutMs: 1 } });
+  const log = createPgCoordinatorLog(db.pool);
+  const prepare = async (decision) => {
+    const c = candidate();
+    const txId = `p04-${decision}-${c.correlationId}`;
+    const payload = {
+      correlationId: c.correlationId,
+      kind: 'create',
+      version: 1,
+      incident: { ...mergeFor(c), correlationId: c.correlationId },
+      newAlertIds: c.alertIds,
+    };
+    assert.equal(await svc.participant.canCommit(txId, payload), 'yes');
+    await svc.participant.preCommit(txId);
+    await log.put({ txId, state: decision, payloads: {}, updatedAt: Date.now() });
+    return { txId, c };
+  };
+  // Case (a): the participant pre-committed, but the coordinator decided abort.
+  const aborted = await prepare('ABORTED');
+  const committed = await prepare('COMMITTED');
+  const pending = await prepare('PRECOMMITTED');
+  await new Promise((r) => setTimeout(r, 10));
+  const res = await svc.participant.sweep();
+
+  const state = async (txId) => (await db.pool.query('SELECT state FROM tpc_participant WHERE tx_id = $1', [txId])).rows[0].state;
+  assert.equal(await state(aborted.txId), 'ABORTED', 'coordinator said ABORTED: no self-commit');
+  assert.equal(await state(committed.txId), 'COMMITTED');
+  assert.equal(await state(pending.txId), 'PRECOMMITTED', 'coordinator still deciding: leave it');
+  assert.ok(res.aborted.includes(aborted.txId));
+  assert.ok(res.committed.includes(committed.txId));
+  const rows = async (c) => (await db.pool.query('SELECT 1 FROM incidents WHERE correlation_id = $1', [c.correlationId])).rowCount;
+  assert.equal(await rows(aborted.c), 0);
+  assert.equal(await rows(committed.c), 1);
+  await svc.participant.abort(pending.txId);
 });

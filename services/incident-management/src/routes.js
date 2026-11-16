@@ -8,6 +8,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 //   GET   /incidents/:id/history                           -> {items} | 404
 //   PATCH /incidents/:id {status, version, actor?, note?}  -> incident | 400 | 404 | 409
 //   GET   /tpc/transactions?limit=&correlationId=          -> {items} (coordinator log, newest first)
+//   GET   /tpc/transactions/:txId                          -> entry | 404 (decision lookup for participants)
 // Status changes are plain local updates; only correlation decisions use 3PC.
 // incident-updates messages go through the transactional outbox (outbox.js).
 export function registerRoutes(app, { repo, coordinatorLog }) {
@@ -102,4 +103,12 @@ export function registerRoutes(app, { repo, coordinatorLog }) {
     },
     async (request) => ({ items: await coordinatorLog.list({ ...request.query }) }),
   );
+
+  // The coordinator's decision for one transaction. Event Store participants
+  // ask this before acting on their own timeout (P0-4).
+  app.get('/tpc/transactions/:txId', async (request, reply) => {
+    const entry = await coordinatorLog.get(request.params.txId);
+    if (!entry) return reply.code(404).send({ error: 'not_found' });
+    return entry;
+  });
 }
