@@ -87,6 +87,9 @@ export function incidentToProto(incident, outcome = '') {
 function toGrpcError(err) {
   if (err instanceof ValidationError) return { code: grpc.status.INVALID_ARGUMENT, details: err.message };
   if (err instanceof IncidentAborted) return { code: grpc.status.ABORTED, details: err.message };
+  // The coordinator gave up waiting for a transaction lock without writing
+  // anything (R3-2): a retry is safe, so tell the caller to retry.
+  if (err?.name === 'CoordinatorBusy') return { code: grpc.status.UNAVAILABLE, details: err.message };
   if (err?.name === 'IncidentNotFound') return { code: grpc.status.NOT_FOUND, details: err.message };
   return { code: grpc.status.INTERNAL, details: 'internal error' };
 }

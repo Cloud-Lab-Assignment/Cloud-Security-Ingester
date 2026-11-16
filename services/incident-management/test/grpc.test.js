@@ -167,3 +167,18 @@ test('grpc GetIncident returns NOT_FOUND for unknown ids', async () => {
     },
   );
 });
+
+test('grpc maps CoordinatorBusy to UNAVAILABLE so the caller retries (R3-2)', async () => {
+  const { CoordinatorBusy } = await import('@core/tpc');
+  await withServer(
+    {
+      upsertIncident: async () => {
+        throw new CoordinatorBusy('tx-busy', 30000);
+      },
+      getIncident: async () => null,
+    },
+    async (call) => {
+      await assert.rejects(call('UpsertIncident', request()), (err) => err.code === grpc.status.UNAVAILABLE);
+    },
+  );
+});
