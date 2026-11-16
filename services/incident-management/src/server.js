@@ -25,7 +25,6 @@ async function main() {
 
   const pool = createPool(config);
   pool.on('error', (err) => logger.error({ err }, 'idle postgres client error'));
-  await migrate(pool, { logger });
 
   const kafka = createKafka({ clientId: SERVICE, logger });
   const producer = createProducer(kafka);
@@ -36,21 +35,29 @@ async function main() {
   producer.on(producer.events.DISCONNECT, () => {
     producerConnected = false;
   });
-  await producer.connect();
 
+  // Startup order (P1-8): listen on HTTP first so probes get a real 503
+  // instead of "connection refused"; /ready turns 200 only after migrations,
+  // 3PC recovery and the gRPC server are all up.
+  let started = false;
   const app = buildApp({
     service: SERVICE,
     logger,
     ready: async () => {
-      if (!producerConnected) return false;
+      if (!started || !producerConnected) return false;
       await pool.query('SELECT 1');
       return true;
     },
   });
-
-  const outbox = createOutboxRelay({ pool, producer, topic: config.incidentTopic, logger });
   const repo = createIncidentRepo({ pool, correlationWindowMs: config.correlationWindowMs });
   const coordinatorLog = createPgCoordinatorLog(pool);
+  registerRoutes(app, { repo, coordinatorLog });
+  await app.listen({ host: '0.0.0.0', port: config.port });
+
+  await migrate(pool, { logger });
+  await producer.connect();
+
+  const outbox = createOutboxRelay({ pool, producer, topic: config.incidentTopic, logger });
   const eventStore = createEventStoreParticipant({ baseUrl: config.eventStoreUrl, timeoutMs: config.tpcTimeoutMs });
   const service = createIncidentService({
     pool,
@@ -94,9 +101,7 @@ async function main() {
     metrics: grpcMetrics,
   });
   logger.info({ port: grpcPort }, 'gRPC listening');
-
-  registerRoutes(app, { repo, coordinatorLog });
-  await app.listen({ host: '0.0.0.0', port: config.port });
+  started = true;
 
   // Keep finishing deferred transactions without waiting for a restart (P1-2).
   const recoveryLoop = startRecoveryLoop({ recover: service.recover, intervalMs: config.tpcRecoveryIntervalMs, logger });
