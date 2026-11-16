@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { DynamoDBClient, DescribeTableCommand } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { StoreConflict } from '@core/tpc';
+import { awsClientOptions } from './aws-options.js';
 
 export const EVENT_ID_INDEX = 'eventId-index';
 
@@ -13,8 +14,12 @@ export function tableNames(prefix) {
   };
 }
 
-export function createDynamoClients({ region, endpoint }) {
-  const ddb = new DynamoDBClient({ region, ...(endpoint ? { endpoint } : {}) });
+export function createDynamoClients({ region, endpoint, requestTimeoutMs, maxAttempts }) {
+  const ddb = new DynamoDBClient({
+    region,
+    ...awsClientOptions({ requestTimeoutMs, maxAttempts }),
+    ...(endpoint ? { endpoint } : {}),
+  });
   const doc = DynamoDBDocumentClient.from(ddb, {
     marshallOptions: { removeUndefinedValues: true },
   });

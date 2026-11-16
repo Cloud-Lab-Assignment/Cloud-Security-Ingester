@@ -49,7 +49,20 @@ export async function startConsumers({
     registers: [registry],
   });
 
-  async function handle({ topic, partition, message }) {
+  // Heartbeat after each storage call so a slow (but deadline-bounded) call
+  // does not eat into the next message's session budget. A failed heartbeat
+  // (e.g. a rebalance) must not fail a message that is already stored;
+  // kafkajs notices the rebalance on its own.
+  async function beat(heartbeat) {
+    if (!heartbeat) return;
+    try {
+      await heartbeat();
+    } catch (err) {
+      logger.debug({ err: err?.message }, 'kafka heartbeat failed');
+    }
+  }
+
+  async function handle({ topic, partition, message, heartbeat }) {
     const where = { topic, partition, offset: message.offset };
     const event = parse(message);
     const isRaw = topic === rawTopic;
@@ -62,10 +75,12 @@ export async function startConsumers({
     try {
       if (isRaw) {
         const key = await archiveRaw(event);
+        await beat(heartbeat);
         consumed.inc({ topic, result: 'archived' });
         logger.debug({ ...where, eventId: event.eventId, key }, 'archived raw event');
       } else {
         const result = await putEvent(event);
+        await beat(heartbeat);
         consumed.inc({ topic, result });
         logger.debug({ ...where, eventId: event.eventId, result }, 'stored normalized event');
       }

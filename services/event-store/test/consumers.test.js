@@ -65,11 +65,12 @@ async function setup(overrides = {}) {
     registry,
     ...overrides,
   });
-  const deliver = (topic, value) =>
+  const deliver = (topic, value, heartbeat) =>
     kafka.state.eachMessage({
       topic,
       partition: 0,
       message: { offset: '1', key: null, value: value === null ? null : Buffer.from(value) },
+      ...(heartbeat ? { heartbeat } : {}),
     });
   return { kafka, consumers, archived, stored, registry, deliver };
 }
@@ -168,4 +169,29 @@ test('isReady follows group join, crash and stop', async () => {
   await consumers.stop();
   assert.equal(kafka.state.disconnected, true);
   assert.equal(consumers.isReady(), false);
+});
+
+test('heartbeats after each storage call; a failing heartbeat does not fail the message', async () => {
+  const order = [];
+  const { deliver, stored } = await setup({
+    putEvent: async (e) => {
+      order.push('put');
+      stored.push(e);
+      return 'stored';
+    },
+    archiveRaw: async () => {
+      order.push('archive');
+      return 'k';
+    },
+  });
+  const heartbeat = async () => {
+    order.push('heartbeat');
+  };
+  await deliver('normalized-events', JSON.stringify(normalizedEvent()), heartbeat);
+  await deliver('raw-events', JSON.stringify(rawEvent()), heartbeat);
+  assert.deepEqual(order, ['put', 'heartbeat', 'archive', 'heartbeat']);
+  await deliver('normalized-events', JSON.stringify(normalizedEvent()), async () => {
+    throw new Error('The group is rebalancing');
+  });
+  assert.equal(stored.length, 2);
 });

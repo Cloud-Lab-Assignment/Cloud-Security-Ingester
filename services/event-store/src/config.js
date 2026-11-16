@@ -19,6 +19,10 @@ export function loadConfig() {
     s3Endpoint: envStr('S3_ENDPOINT', undefined),
     rawBucket: envStr('RAW_BUCKET', 'cs-raw-events'),
     tablePrefix: envStr('TABLE_PREFIX', 'cs-'),
+    // Per-attempt deadline and attempts for every DynamoDB/S3 call; keep
+    // attempts x (timeout + 1 s connect) well below the 30 s Kafka session timeout.
+    awsRequestTimeoutMs: envInt('AWS_REQUEST_TIMEOUT_MS', 5000),
+    awsMaxAttempts: envInt('AWS_MAX_ATTEMPTS', 3),
     tpcTimeoutMs: envInt('TPC_TIMEOUT_MS', 10_000),
     tpcForceVote: forceVote,
     // 3PC coordinator (incident-management) asked for its decision before a

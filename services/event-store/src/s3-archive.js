@@ -1,11 +1,16 @@
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { isIsoTimestamp } from '@core/common';
+import { awsClientOptions } from './aws-options.js';
 
 const SAFE_ID = /^[A-Za-z0-9._-]+$/;
 
 // A custom endpoint (MinIO or another emulator) needs path-style addressing.
-export function createS3Client({ region, endpoint }) {
-  return new S3Client({ region, ...(endpoint ? { endpoint, forcePathStyle: true } : {}) });
+export function createS3Client({ region, endpoint, requestTimeoutMs, maxAttempts }) {
+  return new S3Client({
+    region,
+    ...awsClientOptions({ requestTimeoutMs, maxAttempts }),
+    ...(endpoint ? { endpoint, forcePathStyle: true } : {}),
+  });
 }
 
 // raw/yyyy/mm/dd/hh/<eventId>.json, partitioned by receivedAt in UTC.

@@ -16,8 +16,9 @@ async function main() {
   const config = loadConfig();
   logger.info({ config: { ...config } }, 'starting event-store');
 
-  const { ddb, doc } = createDynamoClients({ region: config.awsRegion, endpoint: config.dynamodbEndpoint });
-  const s3 = createS3Client({ region: config.awsRegion, endpoint: config.s3Endpoint });
+  const deadlines = { requestTimeoutMs: config.awsRequestTimeoutMs, maxAttempts: config.awsMaxAttempts };
+  const { ddb, doc } = createDynamoClients({ region: config.awsRegion, endpoint: config.dynamodbEndpoint, ...deadlines });
+  const s3 = createS3Client({ region: config.awsRegion, endpoint: config.s3Endpoint, ...deadlines });
   const repo = createDynamoRepo({ doc, tablePrefix: config.tablePrefix });
   const archive = createS3Archive({ s3, bucket: config.rawBucket });
   const participant = createCorrelationParticipant({
