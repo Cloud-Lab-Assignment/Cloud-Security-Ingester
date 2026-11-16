@@ -32,6 +32,7 @@ async function main() {
       logger,
     }),
     resolveTimeoutMs: config.coordinatorTimeoutMs + 1000,
+    logger,
   });
 
   let consumers = null;
@@ -58,9 +59,11 @@ async function main() {
   await app.listen({ host: '0.0.0.0', port: config.port });
 
   // Participant-side 3PC timeouts. Each timed-out record first asks the
-  // coordinator (COORDINATOR_URL) for its decision; only when it has none
-  // (unreachable/unknown) does the timeout rule apply: UNCERTAIN -> ABORTED,
-  // PRECOMMITTED -> COMMITTED. The first sweep after a restart works the same way.
+  // coordinator (COORDINATOR_URL) for its decision; only when it is
+  // unreachable (or does not answer in time) does the timeout rule apply:
+  // UNCERTAIN -> ABORTED, PRECOMMITTED -> COMMITTED. A coordinator that never
+  // started the tx (404) aborts UNCERTAIN and leaves PRECOMMITTED pending; an
+  // error answer leaves both pending. The first sweep after a restart works the same way.
   let sweeping = false;
   const sweepTimer = setInterval(async () => {
     if (sweeping) return;
@@ -68,7 +71,7 @@ async function main() {
     try {
       const { committed, aborted, pending } = await participant.sweep();
       if (committed.length || aborted.length) logger.info({ committed, aborted }, '3pc sweep resolved transactions');
-      if (pending.length) logger.debug({ pending }, '3pc sweep: coordinator still deciding');
+      if (pending.length) logger.debug({ pending }, '3pc sweep: waiting for the coordinator');
     } catch (err) {
       logger.error({ err }, '3pc sweep failed');
     } finally {

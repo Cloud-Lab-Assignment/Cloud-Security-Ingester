@@ -650,3 +650,33 @@ test('memory store commit: conditional, atomic and idempotent', async () => {
   // Without businessWrites there is no commit (apply + put path).
   assert.equal(memoryStore().commit, undefined);
 });
+
+// --- R2-3: the coordinator never started the tx ('UNKNOWN') ---
+
+function recordingLogger() {
+  const lines = [];
+  const at = (level) => (obj, msg) => lines.push({ level, obj, msg });
+  return { lines, error: at('error'), warn: at('warn'), info: at('info'), debug: at('debug') };
+}
+
+test("sweep: coordinator says UNKNOWN → abort UNCERTAIN, keep PRECOMMITTED pending and log an error", async () => {
+  const logger = recordingLogger();
+  const { p, store, applied } = await expired(async () => 'UNKNOWN', { logger });
+  const before = await store.get('t2');
+  assert.deepEqual(await p.sweep(), { committed: [], aborted: ['t1'], pending: ['t2'] });
+  assert.equal(await stateOf(store, 't1'), 'ABORTED');
+  assert.deepEqual(await store.get('t2'), before);
+  assert.equal(applied.length, 0);
+  const errors = logger.lines.filter((l) => l.level === 'error');
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].obj.txId, 't2');
+  // Still there on the next sweep, still not committed.
+  assert.deepEqual(await p.sweep(), { committed: [], aborted: [], pending: ['t2'] });
+  assert.equal(await stateOf(store, 't2'), 'PRECOMMITTED');
+});
+
+test('sweep: UNKNOWN without a logger still keeps PRECOMMITTED pending', async () => {
+  const { p, store } = await expired(async () => 'UNKNOWN');
+  assert.deepEqual(await p.sweep(), { committed: [], aborted: ['t1'], pending: ['t2'] });
+  assert.equal(await stateOf(store, 't2'), 'PRECOMMITTED');
+});

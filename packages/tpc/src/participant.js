@@ -16,8 +16,15 @@ export const ABORTED = 'ABORTED';
 //          the coordinator (optional `resolve(txId)`) for its decision:
 //            'COMMITTED' -> apply + COMMITTED  'ABORTED' -> ABORTED
 //            'PENDING'   -> untouched (the coordinator is alive and will finish it)
-//            null / error / no answer within resolveTimeoutMs -> timeout rule:
+//            'UNKNOWN'   -> the coordinator never started the tx (it logs
+//                           WAITING before any canCommit):
+//                           UNCERTAIN -> ABORTED; PRECOMMITTED -> untouched,
+//                           reported as pending and logged at error level
+//                           (impossible with an intact coordinator log)
+//            null / error / no answer within resolveTimeoutMs (coordinator
+//            unreachable) -> timeout rule:
 //              UNCERTAIN -> ABORTED; PRECOMMITTED -> apply + COMMITTED
+//          Any other answer counts as null.
 //
 // Store contract: get(txId), listPending(), put(record, expected), and
 // optionally commit(record, expected). Every write passes the state this
@@ -37,7 +44,7 @@ export const ABORTED = 'ABORTED';
 // both apply before one of them loses the write.
 const CONFLICT_ATTEMPTS = 3;
 
-const DECISIONS = new Set([COMMITTED, ABORTED, 'PENDING']);
+const DECISIONS = new Set([COMMITTED, ABORTED, 'PENDING', 'UNKNOWN']);
 
 export function createParticipant({
   store,
@@ -48,6 +55,7 @@ export function createParticipant({
   forceVote,
   resolve,
   resolveTimeoutMs = 5000,
+  logger,
 }) {
   // Serialise work per txId inside this process so concurrent messages
   // (e.g. a doCommit racing the sweeper) cannot apply twice.
@@ -178,6 +186,16 @@ export function createParticipant({
       await operation(candidate.txId, async () => {
         const rec = await store.get(candidate.txId);
         if (!undecided(rec) || !expired(rec)) return;
+        if (decision === 'UNKNOWN' && rec.state === PRECOMMITTED) {
+          // Someone sent preCommit for a tx the coordinator has no entry for:
+          // neither commit nor abort is known to be safe. Leave it to an operator.
+          logger?.error(
+            { txId: rec.txId, state: rec.state },
+            '3pc coordinator has no record of a PRECOMMITTED transaction; leaving it pending',
+          );
+          pending.push(rec.txId);
+          return;
+        }
         const commit = decision === COMMITTED || (decision === null && rec.state === PRECOMMITTED);
         if (commit) {
           await commitRecord(rec);

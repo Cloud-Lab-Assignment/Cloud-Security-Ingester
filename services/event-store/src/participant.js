@@ -30,7 +30,9 @@ export function validateCorrelationPayload(p) {
 // DynamoDB store, commits go through store.commit, which writes the row and
 // COMMITTED atomically (R2-2); `apply` is only used by stores without commit.
 // `resolve` (optional) asks the coordinator for its decision before the sweeper
-// acts on a timed-out transaction (see coordinator-client.js).
+// acts on a timed-out transaction (see coordinator-client.js). `logger`
+// (optional) gets an error when the coordinator has no record of a
+// PRECOMMITTED transaction (R2-3).
 export function createCorrelationParticipant({
   store,
   putCorrelation,
@@ -39,6 +41,7 @@ export function createCorrelationParticipant({
   now = Date.now,
   resolve,
   resolveTimeoutMs,
+  logger,
 }) {
   const participant = createParticipant({
     store,
@@ -47,6 +50,7 @@ export function createCorrelationParticipant({
     now,
     resolve,
     resolveTimeoutMs,
+    logger,
     validate: async (txId, payload) => validateCorrelationPayload(payload),
     apply: async (payload) => {
       await putCorrelation(correlationItem({ txId: payload.txId, payload, updatedAt: now() }));
