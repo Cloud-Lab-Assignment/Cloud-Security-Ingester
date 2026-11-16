@@ -119,3 +119,79 @@ test('alert missing required fields is skipped without throw', async () => {
   assert.equal(calls.enrich.length, 0);
   assert.equal(calls.upsert.length, 0);
 });
+
+test('wrong-typed alert fields are skipped without throw and leave the correlator unchanged', async () => {
+  const { deps, calls, registry } = setup();
+  const base = makeAlert({ entityKey: '192.0.2.77' });
+  const badFields = [
+    { alertId: 42 },
+    { alertId: '' },
+    { entityKey: { ip: '192.0.2.77' } },
+    { entityKey: '' },
+    { severity: 3 },
+    { alertTime: 123 },
+    { alertTime: 'yesterday' },
+    { window: 'x' },
+    { window: [] },
+    { window: { start: 'nope', end: base.window.end } },
+    { window: { start: base.window.start, end: 5 } },
+    { eventCount: '5' },
+    { eventCount: -1 },
+    { eventCount: 1.5 },
+    { relatedEventIds: 'a' },
+    { relatedEventIds: [1, 2] },
+    { ruleId: 7 },
+    { entity: 'x' },
+    { entity: [] },
+  ];
+  for (const bad of badFields) {
+    const message = { key: Buffer.from(base.entityKey), value: Buffer.from(JSON.stringify({ ...base, ...bad })) };
+    await handleAlert(message, deps, { topic: 'security-alerts', partition: 0 });
+  }
+  assert.equal(calls.upsert.length, 0);
+  assert.equal(calls.enrich.length, 0);
+  assert.equal(await metricValue(registry, 'alerts_consumed_total', { result: 'invalid' }), badFields.length);
+
+  // the correlator never saw them: the valid alert with the same alertId is
+  // new (not a duplicate) and opens a one-alert group
+  await handleAlert(toMessage(base), deps);
+  assert.equal(calls.upsert.length, 1);
+  assert.deepEqual(calls.upsert[0].candidate.alertIds, [base.alertId]);
+});
+
+test('optional alert fields may be absent or null', async () => {
+  const { deps, calls } = setup();
+  const alert = makeAlert({ entityKey: '192.0.2.78' });
+  for (const field of ['window', 'eventCount', 'relatedEventIds', 'ruleId', 'entity']) delete alert[field];
+  await handleAlert(toMessage(alert), deps);
+  const nulls = { ...makeAlert({ entityKey: '192.0.2.78', minutes: 1 }), window: null, eventCount: null, relatedEventIds: null, ruleId: null, entity: null };
+  await handleAlert(toMessage(nulls), deps);
+  // unknown severity strings still map to medium
+  await handleAlert(toMessage(makeAlert({ entityKey: '192.0.2.79', severity: 'urgent' })), deps);
+  assert.equal(calls.upsert.length, 3);
+  assert.equal(calls.upsert[1].candidate.alertIds.length, 2);
+  assert.equal(calls.upsert[2].candidate.severity, 'medium');
+});
+
+test('an alert whose ingest throws is skipped as invalid', async () => {
+  const { deps, calls, registry } = setup();
+  deps.correlator = {
+    ingest() { throw new TypeError('unexpected'); },
+    forget() {},
+  };
+  await handleAlert(toMessage(makeAlert()), deps);
+  assert.equal(calls.upsert.length, 0);
+  assert.equal(await metricValue(registry, 'alerts_consumed_total', { result: 'invalid' }), 1);
+});
+
+test('invalid alerts are logged at warn with topic, partition and offset', async () => {
+  const { deps } = setup();
+  const warnings = [];
+  deps.logger = { ...silentLogger, warn: (obj, msg) => warnings.push({ obj, msg }) };
+  await handleAlert({ ...toMessage({ ...makeAlert(), window: 'x' }), offset: '17' }, deps, { topic: 'security-alerts', partition: 2 });
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].obj.topic, 'security-alerts');
+  assert.equal(warnings[0].obj.partition, 2);
+  assert.equal(warnings[0].obj.offset, '17');
+  assert.match(warnings[0].obj.reason, /window/);
+});

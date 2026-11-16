@@ -64,7 +64,7 @@ try {
     logger,
     topic: config.alertTopic,
     groupId: config.kafkaGroupId,
-    handle: (message) => handleAlert(message, deps),
+    handle: (message, where) => handleAlert(message, deps, where),
   });
   logger.info(
     {

@@ -18,6 +18,43 @@ export function createMetrics(registry) {
   };
 }
 
+// UTC ISO-8601 date-time with an explicit zone, as upstream's toISOString().
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+const isIsoTime = (v) => typeof v === 'string' && ISO_TIME.test(v) && !Number.isNaN(Date.parse(v));
+const isNonEmptyString = (v) => typeof v === 'string' && v !== '';
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const present = (v) => v !== undefined && v !== null;
+
+// Check the fields the correlator reads. Returns an error string or null.
+// Required: alertId, entityKey (non-empty strings), alertTime (ISO time).
+// severity must be a string when present; unknown values map to medium.
+// Optional (absent or null is fine; upstream detection-rules always sends
+// them): window {start, end} (ISO times), eventCount (integer >= 0),
+// relatedEventIds (string[]), ruleId (string), entity (object).
+// When window is absent the correlator uses alertTime as the window.
+export function validateAlert(alert) {
+  if (!isPlainObject(alert)) return 'not a JSON object';
+  for (const field of ['alertId', 'entityKey']) {
+    if (!isNonEmptyString(alert[field])) return `${field} must be a non-empty string`;
+  }
+  if (!isIsoTime(alert.alertTime)) return 'alertTime must be an ISO-8601 timestamp';
+  if (present(alert.severity) && typeof alert.severity !== 'string') return 'severity must be a string';
+  if (present(alert.window)) {
+    if (!isPlainObject(alert.window)) return 'window must be an object';
+    if (!isIsoTime(alert.window.start) || !isIsoTime(alert.window.end)) return 'window.start and window.end must be ISO-8601 timestamps';
+  }
+  if (present(alert.eventCount) && !(Number.isInteger(alert.eventCount) && alert.eventCount >= 0)) {
+    return 'eventCount must be a non-negative integer';
+  }
+  if (present(alert.relatedEventIds)
+    && !(Array.isArray(alert.relatedEventIds) && alert.relatedEventIds.every((id) => typeof id === 'string'))) {
+    return 'relatedEventIds must be an array of strings';
+  }
+  if (present(alert.ruleId) && typeof alert.ruleId !== 'string') return 'ruleId must be a string';
+  if (present(alert.entity) && !isPlainObject(alert.entity)) return 'entity must be an object';
+  return null;
+}
+
 function parseAlert(message) {
   const text = message?.value == null ? '' : message.value.toString('utf8');
   let alert;
@@ -26,30 +63,42 @@ function parseAlert(message) {
   } catch {
     return { error: 'invalid JSON' };
   }
-  if (!alert || typeof alert !== 'object' || Array.isArray(alert)) return { error: 'not a JSON object' };
-  for (const field of ['alertId', 'entityKey', 'alertTime']) {
-    if (typeof alert[field] !== 'string' || alert[field] === '') return { error: `missing ${field}` };
-  }
-  if (Number.isNaN(Date.parse(alert.alertTime))) return { error: 'invalid alertTime' };
-  return { alert };
+  const error = validateAlert(alert);
+  return error ? { error } : { alert };
 }
 
 // Handle one security-alerts message.
 // deps: { correlator, fetchEnrichment, upsertIncident, logger, metrics }
+// where: { topic, partition } of the message, for logs.
+// An invalid alert (bad JSON, wrong field types, or any error thrown by
+// correlator.ingest) is logged at warn, counted as result="invalid" and
+// skipped, so its offset is committed and the consumer keeps going.
 // Throws only when the upsert failed with a retryable gRPC error, after
 // forgetting the alert, so the kafkajs retry re-ingests and re-sends it.
-export async function handleAlert(message, deps) {
+export async function handleAlert(message, deps, where = {}) {
   const { correlator, fetchEnrichment, upsertIncident, logger, metrics } = deps;
   const count = (result) => metrics?.alertsConsumed.inc({ result });
+  const skipInvalid = (reason, extra = {}) => {
+    logger.warn(
+      { reason, topic: where.topic, partition: where.partition, offset: message?.offset, ...extra },
+      'skipping invalid security alert',
+    );
+    count('invalid');
+  };
 
   const { alert, error } = parseAlert(message);
   if (error) {
-    logger.warn({ reason: error, offset: message?.offset }, 'skipping invalid security alert');
-    count('invalid');
+    skipInvalid(error);
     return;
   }
 
-  const candidate = correlator.ingest(alert);
+  let candidate;
+  try {
+    candidate = correlator.ingest(alert);
+  } catch (err) {
+    skipInvalid(`ingest failed: ${err?.message ?? err}`, { err, alertId: alert.alertId });
+    return;
+  }
   if (!candidate) {
     logger.debug({ alertId: alert.alertId }, 'duplicate alert ignored');
     count('duplicate');
@@ -113,7 +162,7 @@ export async function startConsumer({ kafka, logger, topic, groupId, handle }) {
   await consumer.connect();
   await consumer.subscribe({ topic, fromBeginning: true });
   await consumer.run({
-    eachMessage: async ({ message, partition }) => handle(message, { partition }),
+    eachMessage: async ({ topic: t, partition, message }) => handle(message, { topic: t, partition }),
   });
   logger.info({ topic, groupId }, 'consuming security alerts');
 
