@@ -40,14 +40,33 @@ export class InvalidCursorError extends Error {
   }
 }
 
+// DynamoDB key size limits, in bytes of UTF-8.
+export const MAX_PARTITION_KEY_BYTES = 2048;
+export const MAX_SORT_KEY_BYTES = 1024;
+
+// Canonical millisecond ISO form so sort keys compare correctly as strings.
+const canonicalTime = (t) => new Date(t).toISOString();
+
+// The sort-key bounds of an events query for from <= eventTime <= to.
+export function sortKeyRange({ from, to }) {
+  return { min: canonicalTime(from), max: `${canonicalTime(to)}#\uffff` };
+}
+
+// A DynamoDB key string: non-empty, valid UTF-8 (no lone surrogates), within `maxBytes`.
+const validKeyString = (v, maxBytes) =>
+  typeof v === 'string' && v.length > 0 && v.isWellFormed() && Buffer.byteLength(v, 'utf8') <= maxBytes;
+
 // Cursor = base64url(JSON(LastEvaluatedKey)) of the events table, i.e. exactly
-// {entityKey, sk} as strings. When `entityKey` is given, the cursor must belong
-// to that entity (a cursor from another query is rejected, not followed).
+// {entityKey, sk} as strings that DynamoDB accepts as a key (R2-8). When
+// `entityKey` is given, the cursor must belong to that entity (a cursor from
+// another query is rejected, not followed). When `range` ({from, to}) is
+// given, sk must lie inside that query's sort-key range: DynamoDB rejects a
+// start key outside the key condition with a ValidationException.
 export function encodeCursor(lastEvaluatedKey) {
   return Buffer.from(JSON.stringify(lastEvaluatedKey)).toString('base64url');
 }
 
-export function decodeCursor(cursor, entityKey) {
+export function decodeCursor(cursor, entityKey, range) {
   if (typeof cursor !== 'string' || !/^[A-Za-z0-9_-]+$/.test(cursor)) throw new InvalidCursorError();
   let key;
   try {
@@ -58,9 +77,15 @@ export function decodeCursor(cursor, entityKey) {
   if (key === null || typeof key !== 'object' || Array.isArray(key)) throw new InvalidCursorError();
   const fields = Object.keys(key).sort();
   if (fields.length !== 2 || fields[0] !== 'entityKey' || fields[1] !== 'sk') throw new InvalidCursorError();
-  if (typeof key.entityKey !== 'string' || typeof key.sk !== 'string') throw new InvalidCursorError();
+  if (!validKeyString(key.entityKey, MAX_PARTITION_KEY_BYTES) || !validKeyString(key.sk, MAX_SORT_KEY_BYTES)) {
+    throw new InvalidCursorError();
+  }
   if (entityKey !== undefined && key.entityKey !== entityKey) {
     throw new InvalidCursorError('cursor belongs to another entityKey');
+  }
+  if (range !== undefined) {
+    const { min, max } = sortKeyRange(range);
+    if (key.sk < min || key.sk > max) throw new InvalidCursorError('cursor is outside the queried time range');
   }
   return { entityKey: key.entityKey, sk: key.sk };
 }
@@ -90,9 +115,6 @@ export function correlationItem({ txId, payload, updatedAt }) {
   const { txId: _folded, ...rest } = payload;
   return { ...rest, txId, recordedAt: new Date(updatedAt).toISOString() };
 }
-
-// Canonical millisecond ISO form so sort keys compare correctly as strings.
-const canonicalTime = (t) => new Date(t).toISOString();
 
 // The normalized event is kept verbatim as a JSON string in `doc`: it round-trips
 // exactly (large integers, deep nesting, empty values) without DynamoDB type limits.
@@ -155,18 +177,15 @@ export function createDynamoRepo({ doc, tablePrefix }) {
   // Events for one entity with from <= eventTime <= to, oldest first.
   async function queryEvents({ entityKey, from, to, limit = 100, cursor }) {
     const key = storageKey(entityKey);
+    const { min, max } = sortKeyRange({ from, to });
     const out = await doc.send(
       new QueryCommand({
         TableName: tables.events,
         KeyConditionExpression: 'entityKey = :e AND sk BETWEEN :from AND :toMax',
-        ExpressionAttributeValues: {
-          ':e': key,
-          ':from': canonicalTime(from),
-          ':toMax': `${canonicalTime(to)}#￿`,
-        },
+        ExpressionAttributeValues: { ':e': key, ':from': min, ':toMax': max },
         Limit: limit,
         ScanIndexForward: true,
-        ...(cursor ? { ExclusiveStartKey: decodeCursor(cursor, key) } : {}),
+        ...(cursor ? { ExclusiveStartKey: decodeCursor(cursor, key, { from, to }) } : {}),
       }),
     );
     return {

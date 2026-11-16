@@ -133,6 +133,30 @@ test('GET /events rejects cursors that are not exactly {entityKey, sk} for this 
   assert.equal(repo.calls.queryEvents.length, 0);
 });
 
+test('GET /events rejects cursor edge cases with 400 (R2-8)', async () => {
+  const { app, repo } = setup();
+  const cursors = [
+    { entityKey: 'x', sk: '' }, // empty sort key
+    { entityKey: '', sk: '2026-11-16T05:10:00.000Z#e' }, // empty partition key
+    { entityKey: 'x', sk: `2026-11-16T05:10:00.000Z#${'e'.repeat(1000)}` }, // sort key > 1024 bytes
+    { entityKey: 'x', sk: `2026-11-16T05:10:00.000Z#${'é'.repeat(500)}` }, // > 1024 bytes in 525 characters
+    { entityKey: 'x'.repeat(2049), sk: '2026-11-16T05:10:00.000Z#e' }, // partition key > 2048 bytes
+    { entityKey: 'x', sk: '2026-11-16T05:10:00.000Z#\ud800' }, // not encodable as UTF-8
+    { entityKey: 'x', sk: '2026-11-16T04:10:00.000Z#e' }, // before `from` (default: an hour before now)
+    { entityKey: 'x', sk: '2026-11-16T06:10:00.000Z#e' }, // after `to`
+  ];
+  for (const key of cursors) {
+    const res = await app.inject(`/events?entityKey=x&cursor=${encodeCursor(key)}`);
+    assert.equal(res.statusCode, 400, JSON.stringify(key).slice(0, 80));
+    assert.equal(res.json().error, 'bad_request');
+  }
+  // The same cursor is fine for a range that contains it.
+  const later = encodeCursor({ entityKey: 'x', sk: '2026-11-16T06:10:00.000Z#e' });
+  const res = await app.inject(`/events?entityKey=x&to=2026-11-16T07:00:00.000Z&cursor=${later}`);
+  assert.equal(res.statusCode, 200);
+  assert.equal(repo.calls.queryEvents.length, 1);
+});
+
 test('GET /events with an oversized entityKey accepts cursors for its hashed storage key', async () => {
   const { app, repo } = setup();
   const entityKey = 'u'.repeat(3000);

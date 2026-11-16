@@ -31,7 +31,7 @@ function parseEventsQuery(q, now) {
   }
   if (cursor !== undefined) {
     try {
-      decodeCursor(cursor, storageKey(entityKey));
+      decodeCursor(cursor, storageKey(entityKey), { from: fromMs, to: toMs });
     } catch {
       return { error: 'cursor is invalid' };
     }

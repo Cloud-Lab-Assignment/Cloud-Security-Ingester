@@ -40,6 +40,38 @@ test('cursor must be exactly string {entityKey, sk}, for the expected entity', (
   assert.deepEqual(decodeCursor(encodeCursor({ sk, entityKey: 'x' }), 'x'), { entityKey: 'x', sk });
 });
 
+test('cursor keys must be non-empty, well-formed and within DynamoDB key byte limits (R2-8)', () => {
+  const sk = '2026-11-16T05:00:00.000Z#abc';
+  const ok = (key) => assert.deepEqual(decodeCursor(encodeCursor(key)), key, JSON.stringify(key).slice(0, 60));
+  const bad = (key) => assert.throws(() => decodeCursor(encodeCursor(key)), InvalidCursorError, JSON.stringify(key).slice(0, 60));
+  bad({ entityKey: '', sk });
+  bad({ entityKey: 'x', sk: '' });
+  bad({ entityKey: '', sk: '' });
+  // Sort key: at most 1024 bytes of UTF-8.
+  ok({ entityKey: 'x', sk: 's'.repeat(1024) });
+  bad({ entityKey: 'x', sk: 's'.repeat(1025) });
+  ok({ entityKey: 'x', sk: 'é'.repeat(512) }); // 1024 bytes
+  bad({ entityKey: 'x', sk: 'é'.repeat(513) }); // 1026 bytes, 513 characters
+  // Partition key: at most 2048 bytes of UTF-8.
+  ok({ entityKey: 'e'.repeat(2048), sk });
+  bad({ entityKey: 'e'.repeat(2049), sk });
+  bad({ entityKey: '€'.repeat(683), sk }); // 2049 bytes, 683 characters
+  // Lone surrogates cannot be encoded as UTF-8.
+  bad({ entityKey: 'x', sk: `${sk}\ud800` });
+  bad({ entityKey: '\udc00', sk });
+});
+
+test('cursor sort key must lie inside the queried time range (R2-8)', () => {
+  const range = { from: '2026-11-16T05:00:00.000Z', to: '2026-11-16T06:00:00.000Z' };
+  const at = (sk) => encodeCursor({ entityKey: 'x', sk });
+  for (const sk of ['2026-11-16T05:00:00.000Z', '2026-11-16T05:30:00.000Z#e', '2026-11-16T06:00:00.000Z#zzz']) {
+    assert.deepEqual(decodeCursor(at(sk), 'x', range), { entityKey: 'x', sk }, sk);
+  }
+  for (const sk of ['2026-11-16T04:59:59.999Z#e', '2026-11-16T06:00:00.001Z#e', '2020', '~']) {
+    assert.throws(() => decodeCursor(at(sk), 'x', range), InvalidCursorError, sk);
+  }
+});
+
 test('storageKey keeps keys up to 1024 UTF-8 bytes and hashes longer ones', () => {
   assert.equal(storageKey('10.0.0.5'), '10.0.0.5');
   const max = 'a'.repeat(MAX_ENTITY_KEY_BYTES);
@@ -263,6 +295,17 @@ describe('dynamodb repo (integration)', { skip: !process.env.INTEGRATION }, () =
     assert.equal(page2.items[0].eventTime, '2026-11-16T05:02:00.000Z');
     // Another entity's cursor is rejected before it reaches DynamoDB.
     await assert.rejects(repo.queryEvents({ ...q, entityKey: `k-${randomUUID()}`, cursor: page1.nextCursor }), InvalidCursorError);
+  });
+
+  test('queryEvents rejects edge-case cursors as InvalidCursorError, not a DynamoDB error (R2-8)', async () => {
+    const entityKey = `k-${randomUUID()}`;
+    const q = { entityKey, from: '2026-11-16T05:00:00.000Z', to: '2026-11-16T06:00:00.000Z', limit: 1 };
+    for (const sk of ['', 's'.repeat(1025), '2020-01-01T00:00:00.000Z#e', '2030-01-01T00:00:00.000Z#e']) {
+      await assert.rejects(repo.queryEvents({ ...q, cursor: encodeCursor({ entityKey, sk }) }), InvalidCursorError, sk.slice(0, 30));
+    }
+    // An in-range cursor still works (no events after it).
+    const res = await repo.queryEvents({ ...q, cursor: encodeCursor({ entityKey, sk: '2026-11-16T05:30:00.000Z#e' }) });
+    assert.deepEqual(res, { items: [], nextCursor: null });
   });
 
   test('an entityKey over the DynamoDB key limit is stored under its hash and queryable by the original', async () => {
