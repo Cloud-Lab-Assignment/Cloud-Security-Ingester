@@ -96,3 +96,23 @@ Round-1 verdicts (static review):
 ## Done log
 
 <!-- The box agent appends: item ID, commit SHA, test evidence. -->
+
+### 16 Nov 2026 (box agent)
+
+All nine items are done (R2-1 to R2-9). Each behaviour fix had a test that failed on the old code first; one commit per item, or one per half where a fix spans the shared library and a service.
+
+| Item | Commit(s) | Test evidence |
+|---|---|---|
+| R2-1 | `0673524` | `recovery does not abort a tx that run() committed (with pending) after the snapshot` (the review's sequence: recovery aborted B on the old code), `recovery skips an entry that became terminal after the snapshot`, `run() waits for a recovery that holds the same txId`. Per-txId lock held by `run()` and by recovery; recovery re-reads with `log.get` (the Postgres log already had it). |
+| R2-2 | `c2f35a5` (tpc + event-store `TransactWriteItems`), `15cb5f4` (Postgres store) | tpc races (doCommit vs abort, sweep commit vs abort, abort vs commit); DynamoDB Local `concurrent doCommit and abort on two replicas never split` (15 txs); `postgres store commit is atomic with the business write (R2-2)` (incl. 5 concurrent commit-vs-abort races): no business write without COMMITTED and no COMMITTED without one. |
+| R2-3 | `70adeba` (tpc + event-store client), `6ac6a8b` (incident-db `decisionOf`) | One client test per response class (200, 404 → UNKNOWN, 5xx/other/malformed/unknown state → PENDING, transport/connection refused/stalled → unreachable); `incident-db sweep: no coordinator entry means the tx never started (R2-3)`. Lookup timeout kept as "unreachable" and documented as the remaining limit. |
+| R2-4 | `e9ce9df` | `003 upgrades a database that already links one alert to two incidents (R2-4)`: failed with `could not create unique index` before; keeps the earliest owner, index exists. |
+| R2-5 | `9debe3a` | `two overlapping relays keep per-incident order (R2-5a)` (published [2, 1] before), `a 3PC outbox row waits until the coordinator logs COMMITTED (R2-5b)`, plus `a status change queued behind a held-back 3PC row keeps its place`: later rows of the same incident wait behind a held-back 3PC row so order holds. Migration `004_outbox_tx.sql`. |
+| R2-6 | `0cd6b3e` | Unit + DynamoDB Local test: a literal `h:<sha>` key and the long key it hashes stay in separate partitions. |
+| R2-7 | `60d6707` | `replayed old alerts for many entities are evicted without the watermark advancing (R2-7)`: 301 groups before, ≤ 51 after (sweep at least every `evictEvery` = 256 ingests by default). |
+| R2-8 | `ddaaea4` | Cursor edge cases (empty, oversized keys incl. multi-byte, `sk` outside `from`/`to`, lone surrogates) return 400; unit, route and integration tests. |
+| R2-9 | `ed4e860`, `93f3abe` | Docs: required vs optional alert fields, `shasum -a 256`, idempotent effects, qualified non-blocking claim, `UNCERTAIN → COMMITTED`, slow-coordinator split in Known limits; demo output re-recorded. |
+
+Final run on `93f3abe`: `npm test` 203/203 (common 10, tpc 68, event-store 68, incident-management 24, correlation-engine 33); `INTEGRATION=1 npm test -w event-store -w incident-management` 88/88 and 54/54; after `docker compose up -d --build` (migrations 001–004 applied), `npm run test:integration` 2/2 twice and `scripts/demo-3pc.sh` exit 0; `scripts/export-group-repo.sh` re-run: exported services pass 68 / 24 / 33 and build.
+
+Still open (documented, not bugs in this round): P2-2 from round 1 (escalation after a rebalance), the slow-but-alive-coordinator split (needs a termination protocol or consensus), and a PRECOMMITTED record the coordinator has no entry for, which stays pending until an operator resolves it.
