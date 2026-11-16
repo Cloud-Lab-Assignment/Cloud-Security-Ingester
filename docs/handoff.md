@@ -325,78 +325,80 @@ Run on Docker Compose with `scripts/demo-3pc.sh` (Linux or macOS; needs `node`, 
 - Status changes (`PATCH`) are plain local Postgres updates, not 3PC; only correlation decisions use 3PC.
 - When the atomicity guarantee holds, and the two cases where 3PC can split, are explained in `docs/design/core-services.md`.
 
-Output of one run (16 Nov 2026, 09:11 UTC):
+Output of one run (16 Nov 2026, after the round-2 fixes):
 
 ```text
 ==> Scenario 1: normal commit
-    entity 198.18.252.178 has no incident yet
-    sent alert RULE-AUTH-001|198.18.252.178|2d3b7c32-a9…
+    entity 198.18.211.166 has no incident yet
+    sent alert RULE-AUTH-001|198.18.211.166|a03cd5c5-7f…
 {
-  "incidentId": "2cde14cf-994c-4a7c-ba1f-31d68d390dc5",
-  "correlationId": "cor-a41cc5c2a234f9d990b73f4a",
+  "incidentId": "b3d54474-4f26-4db5-abf6-009d9b62884d",
+  "correlationId": "cor-ca41b1351a5bd0607d05f976",
   "status": "open",
   "severity": "high",
   "alertCount": 1,
   "version": 1
 }
-    coordinator log for cor-a41cc5c2a234f9d990b73f4a:
-{"txId":"67813657","state":"COMMITTED","reason":null,"kind":"create","version":1,"correlationId":"cor-a41cc5c2a234f9d990b73f4a"}
+    coordinator log for cor-ca41b1351a5bd0607d05f976:
+{"txId":"2f3b80ba","state":"COMMITTED","reason":null,"kind":"create","version":1,"correlationId":"cor-ca41b1351a5bd0607d05f976"}
     event-store correlation history:
-{"version":1,"kind":"create","txId":"67813657","recordedAt":"2026-11-16T09:11:36.465Z"}
+{"version":1,"kind":"create","txId":"2f3b80ba","recordedAt":"2026-11-16T09:52:59.816Z"}
 
 ==> Scenario 2: the Event Store votes no
     restarting event-store with TPC_FORCE_VOTE=no
-    entity 198.18.249.198 has no incident yet
-    sent alert RULE-AUTH-001|198.18.249.198|42fcb0d3-4f…
-    incidents for 198.18.249.198 (expect none):
+    entity 198.18.175.128 has no incident yet
+    sent alert RULE-AUTH-001|198.18.175.128|a72c5f9c-80…
+    incidents for 198.18.175.128 (expect none):
 []
-    coordinator log for cor-27b7ab4373292368fc74f269 (expect ABORTED vote_no; the correlation engine keeps retrying):
-{"txId":"345f6021","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-27b7ab4373292368fc74f269"}
-{"txId":"7684fd0b","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-27b7ab4373292368fc74f269"}
-{"txId":"51b203cf","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-27b7ab4373292368fc74f269"}
-{"txId":"fb7e607d","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-27b7ab4373292368fc74f269"}
-{"txId":"953149b1","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-27b7ab4373292368fc74f269"}
+    coordinator log for cor-b631d28c757fd5914936860c (expect ABORTED vote_no; the correlation engine keeps retrying):
+{"txId":"5ddf306b","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-b631d28c757fd5914936860c"}
+{"txId":"b826649a","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-b631d28c757fd5914936860c"}
+{"txId":"079f0e68","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-b631d28c757fd5914936860c"}
+{"txId":"ffff4a95","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-b631d28c757fd5914936860c"}
+{"txId":"a400578f","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-b631d28c757fd5914936860c"}
+{"txId":"1c7d3a92","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-b631d28c757fd5914936860c"}
     postgres participant rows for those transactions are ABORTED too:
-345f6021 ABORTED
-7684fd0b ABORTED
-51b203cf ABORTED
-fb7e607d ABORTED
-953149b1 ABORTED
+5ddf306b ABORTED
+b826649a ABORTED
+079f0e68 ABORTED
+ffff4a95 ABORTED
+a400578f ABORTED
+1c7d3a92 ABORTED
     restoring event-store (votes normally); the engine's retry now commits
 {
-  "incidentId": "38a015ef-6614-4159-afae-948a3a8f77a7",
-  "correlationId": "cor-27b7ab4373292368fc74f269",
+  "incidentId": "14432c8c-9b70-4968-b0c6-3a9a755ef0a0",
+  "correlationId": "cor-b631d28c757fd5914936860c",
   "status": "open",
   "severity": "high",
   "alertCount": 1,
   "version": 1
 }
-{"txId":"33680f8a","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-27b7ab4373292368fc74f269"}
-{"txId":"6e810b2e","state":"COMMITTED","reason":null,"kind":"create","version":1,"correlationId":"cor-27b7ab4373292368fc74f269"}
+{"txId":"4d3dd7e9","state":"ABORTED","reason":"vote_no","kind":"create","version":1,"correlationId":"cor-b631d28c757fd5914936860c"}
+{"txId":"abd94004","state":"COMMITTED","reason":null,"kind":"create","version":1,"correlationId":"cor-b631d28c757fd5914936860c"}
 
 ==> Scenario 3: the coordinator crashes after every participant pre-committed
     restarting incident-management with TPC_FAULT=crash-after-precommit
-    entity 198.18.124.175 has no incident yet
-    sent alert RULE-AUTH-001|198.18.124.175|c87b74f4-71…
+    entity 198.18.210.229 has no incident yet
+    sent alert RULE-AUTH-001|198.18.210.229|a754e490-7f…
     incident-management container: exited 1
     "msg":"injected coordinator crash after preCommit"
     coordinator log in postgres (expect PRECOMMITTED) and no incident row yet:
-5be25289 PRECOMMITTED
-0 incident row(s) for 198.18.124.175
+be4d0dce PRECOMMITTED
+0 incident row(s) for 198.18.210.229
     waiting for the Event Store to commit on its own (PRECOMMITTED timeout, coordinator unreachable)…
-    event-store self-committed after ~12s while the coordinator was down:
-{"version":1,"kind":"create","txId":"5be25289","recordedAt":"2026-11-16T09:12:48.457Z"}
+    event-store self-committed after ~11s while the coordinator was down:
+{"version":1,"kind":"create","txId":"be4d0dce","recordedAt":"2026-11-16T09:54:07.222Z"}
     restarting incident-management without the fault: recover() finishes the Postgres side
-    "recovered":["5be25289-8cbb-438e-80f4-3dfacd1ba681"]
+    "recovered":["be4d0dce-ef43-4137-8a26-1f20a8d30e41"]
 {
-  "incidentId": "8d6bb393-c352-44a9-8638-fd259a1a7b6b",
-  "correlationId": "cor-f883d26e4b63ee901fbe08da",
+  "incidentId": "f8e1f2ff-56a0-4bf1-b349-4229d22a2358",
+  "correlationId": "cor-d7d1b8529a000b1620c08da6",
   "status": "open",
   "severity": "high",
   "alertCount": 1,
   "version": 1
 }
-{"txId":"5be25289","state":"COMMITTED","reason":null,"kind":"create","version":1,"correlationId":"cor-f883d26e4b63ee901fbe08da"}
+{"txId":"be4d0dce","state":"COMMITTED","reason":null,"kind":"create","version":1,"correlationId":"cor-d7d1b8529a000b1620c08da6"}
 
 ==> Done. The stack is back to normal (no forced votes, no faults).
     restoring event-store and incident-management to their normal configuration
