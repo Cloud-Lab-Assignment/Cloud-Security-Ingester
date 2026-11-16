@@ -322,3 +322,22 @@ test('PATCH racing a 3PC update never leaves a decided commit unapplied (P0-2)',
     assert.equal(stored.status, 'investigating');
   }
 });
+
+test('findTarget fallback ignores an incident from a different window (P1-6)', { skip }, async () => {
+  const { svc } = service();
+  const c = candidate(); // firstSeen 09:00, lastSeen 09:01 on 16 Nov
+  const { incident } = await svc.upsertIncident(c);
+  // A late, redelivered alert for the same entity from the previous day.
+  const yesterday = {
+    ...c,
+    correlationId: 'cor-yesterday',
+    alertIds: ['old-alert'],
+    firstSeen: '2026-11-15T08:00:00.000Z',
+    lastSeen: '2026-11-15T08:05:00.000Z',
+  };
+  const target = await repo.findTarget(yesterday);
+  assert.equal(target.existing, null, 'yesterday’s alert must not merge into today’s incident');
+  // Inside the window just before the incident still matches.
+  const justBefore = { ...yesterday, firstSeen: '2026-11-16T08:46:00.000Z', lastSeen: '2026-11-16T08:46:00.000Z' };
+  assert.equal((await repo.findTarget(justBefore)).existing?.incidentId, incident.incidentId);
+});

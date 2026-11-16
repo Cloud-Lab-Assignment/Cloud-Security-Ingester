@@ -131,12 +131,16 @@ export function createIncidentRepo({ pool, correlationWindowMs, now = Date.now }
   async function findTarget(candidate, db = pool) {
     let { rows } = await db.query('SELECT * FROM incidents WHERE correlation_id = $1', [candidate.correlationId]);
     if (rows.length === 0) {
+      // The incident's [first_seen, last_seen] must overlap the candidate's
+      // span widened by the window on both sides (P1-6).
       const since = new Date(Date.parse(candidate.firstSeen) - correlationWindowMs);
+      const until = new Date(Date.parse(candidate.lastSeen) + correlationWindowMs);
       ({ rows } = await db.query(
         `SELECT * FROM incidents
-          WHERE entity_key = $1 AND status IN ('open', 'investigating') AND last_seen >= $2
+          WHERE entity_key = $1 AND status IN ('open', 'investigating')
+            AND last_seen >= $2 AND first_seen <= $3
           ORDER BY last_seen DESC LIMIT 1`,
-        [candidate.entityKey, since],
+        [candidate.entityKey, since, until],
       ));
     }
     if (rows.length === 0) return { existing: null, knownAlertIds: new Set() };
