@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { DynamoDBClient, DescribeTableCommand } from '@aws-sdk/client-dynamodb';
 import {
   DynamoDBDocumentClient,
@@ -108,6 +109,37 @@ export function storageKey(entityKey) {
 }
 
 const isConditionFailure = (err) => err?.name === 'ConditionalCheckFailedException';
+
+// The correlation-history row for this commit's (correlationId, version)
+// already exists and was written by a different transaction (R3-1). The
+// commit wrote nothing. Deliberately not a StoreConflict: re-reading the tpc
+// record cannot fix it, so the participant does not retry, doCommit fails
+// (no ack) and the record stays PRECOMMITTED for an operator.
+export class HistoryConflict extends Error {
+  constructor({ txId, correlationId, version, existingTxId }) {
+    super(
+      `tx ${txId}: correlation history ${correlationId} v${version} already holds ` +
+        `${existingTxId ? `tx ${existingTxId}` : 'a different legacy row'}; not committing`,
+    );
+    this.name = 'HistoryConflict';
+    this.txId = txId;
+    this.correlationId = correlationId;
+    this.version = version;
+    this.existingTxId = existingTxId ?? null;
+  }
+}
+
+// The business fields of a history row. (correlationId, version) is the key
+// and recordedAt is the write time, so neither identifies the write.
+const BUSINESS_FIELDS = ['incidentId', 'alertIds', 'decision'];
+
+// Is `existing` the row this commit would write? Rows carry the txId that
+// wrote them; a row without one (hand-seeded, or any pre-txId data) counts as
+// ours only when every business field is deep-equal (map key order ignored).
+function isOwnHistoryRow(existing, item) {
+  if (existing.txId !== undefined) return existing.txId === item.txId;
+  return BUSINESS_FIELDS.every((f) => isDeepStrictEqual(existing[f], item[f]));
+}
 
 // The correlation-history row for a committed 3PC record (R2-2). The txId was
 // folded into the payload at canCommit; recordedAt is the commit time.
@@ -276,12 +308,19 @@ export function createDynamoRepo({ doc, tablePrefix }) {
     //    participant re-reads. This also covers a retry after a crash where
     //    the transaction had gone through: the re-read finds COMMITTED.
     //  - only the history condition failed: the row already exists although
-    //    the record is still in the expected state. Atomic commits cannot
-    //    leave that behind, so it is a row written by the pre-R2-2 apply-then-
-    //    put path (or by another tx for the same correlationId + version, which
-    //    the old apply also treated as "duplicate"). Keep that row and make
-    //    the state move alone, still conditionally.
+    //    the record is still in the expected state. The row is read back
+    //    (ConsistentRead) and compared (R3-1):
+    //      - it is this tx's own write (same txId; for a row without txId,
+    //        same incidentId, alertIds and decision): left by the pre-R2-2
+    //        apply-then-put path. Keep it and make the state move alone,
+    //        still conditionally.
+    //      - it belongs to another tx -> HistoryConflict. Nothing is written,
+    //        the record stays in the expected state (PRECOMMITTED / UNCERTAIN)
+    //        and doCommit is not acknowledged.
+    //      - it is gone again (rows are never deleted, so only by hand) ->
+    //        StoreConflict: the participant re-reads and tries again.
     async commit(record, expected) {
+      const item = correlationItem(record);
       try {
         await doc.send(
           new TransactWriteCommand({
@@ -289,7 +328,7 @@ export function createDynamoRepo({ doc, tablePrefix }) {
               {
                 Put: {
                   TableName: tables.correlations,
-                  Item: correlationItem(record),
+                  Item: item,
                   ConditionExpression: 'attribute_not_exists(correlationId)',
                 },
               },
@@ -304,6 +343,14 @@ export function createDynamoRepo({ doc, tablePrefix }) {
           throw new StoreConflict(record.txId, expected.state);
         }
         if (history === 'ConditionalCheckFailed' && tpc === 'None') {
+          const { correlationId, version } = item;
+          const out = await doc.send(
+            new GetCommand({ TableName: tables.correlations, Key: { correlationId, version }, ConsistentRead: true }),
+          );
+          if (!out.Item) throw new StoreConflict(record.txId, expected.state);
+          if (!isOwnHistoryRow(out.Item, item)) {
+            throw new HistoryConflict({ txId: record.txId, correlationId, version, existingTxId: out.Item.txId });
+          }
           await tpcStore.put(record, expected);
           return;
         }

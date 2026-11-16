@@ -25,6 +25,9 @@ export const ABORTED = 'ABORTED';
 //            unreachable) -> timeout rule:
 //              UNCERTAIN -> ABORTED; PRECOMMITTED -> apply + COMMITTED
 //          Any other answer counts as null.
+//          A record whose resolution throws (store error, or a commit the
+//          store refuses for good) is logged at error level, reported as
+//          pending and left as it was; the rest of the pass goes on.
 //
 // Store contract: get(txId), listPending(), put(record, expected), and
 // optionally commit(record, expected). Every write passes the state this
@@ -183,6 +186,9 @@ export function createParticipant({
         pending.push(candidate.txId);
         continue;
       }
+      // One record failing (e.g. a commit the store refuses, R3-1) must not
+      // stop the rest of the pass: it is logged, reported as pending and
+      // stays undecided, so the next sweep (and the coordinator) retry it.
       await operation(candidate.txId, async () => {
         const rec = await store.get(candidate.txId);
         if (!undecided(rec) || !expired(rec)) return;
@@ -204,6 +210,9 @@ export function createParticipant({
           await record(rec.txId, ABORTED, rec.payload, rec.state);
           aborted.push(rec.txId);
         }
+      }).catch((err) => {
+        logger?.error({ txId: candidate.txId, err }, '3pc sweep could not resolve the transaction; leaving it pending');
+        pending.push(candidate.txId);
       });
     }
     return { committed, aborted, pending };

@@ -12,6 +12,7 @@ import {
   storageKey,
   MAX_ENTITY_KEY_BYTES,
   correlationItem,
+  HistoryConflict,
 } from '../src/dynamo.js';
 import { ensureLocalResources } from '../src/local-setup.js';
 import { StoreConflict, TpcStateError } from '@core/tpc';
@@ -173,31 +174,119 @@ test('tpcStore.commit: tpc condition failed (or a concurrent write) → StoreCon
   }
 });
 
-test('tpcStore.commit: only the history row exists → conditional state move alone', async () => {
-  const doc = fakeDoc(async (cmd, n) => {
+// The fallback reads the existing row (R3-1): a fake doc that cancels the
+// transaction on the history condition and returns `row` for that read.
+function historyExists(row, rest = async () => ({})) {
+  return fakeDoc(async (cmd, n) => {
     if (n === 1) throw cancelled('ConditionalCheckFailed', 'None');
-    return {};
+    if (cmd.constructor.name === 'GetCommand') return row === undefined ? {} : { Item: row };
+    return rest(cmd, n);
   });
-  const repo = createDynamoRepo({ doc, tablePrefix: 'p-' });
+}
+
+const tpcPut = (rec, expected) => ({
+  TableName: 'p-tpc',
+  Item: rec,
+  ConditionExpression: '#s = :expected',
+  ExpressionAttributeNames: { '#s': 'state' },
+  ExpressionAttributeValues: { ':expected': expected },
+});
+
+test("tpcStore.commit: the history row is this tx's own → conditional state move alone", async () => {
   const rec = commitRecord();
+  const doc = historyExists(correlationItem(rec));
+  const repo = createDynamoRepo({ doc, tablePrefix: 'p-' });
   await repo.tpcStore.commit(rec, { state: 'PRECOMMITTED' });
-  assert.equal(doc.sent.length, 2);
-  assert.equal(doc.sent[1].type, 'PutCommand');
+  assert.deepEqual(doc.sent.map((c) => c.type), ['TransactWriteCommand', 'GetCommand', 'PutCommand']);
+  // The existing row is read strongly consistently, by its key.
   assert.deepEqual(doc.sent[1].input, {
-    TableName: 'p-tpc',
-    Item: rec,
-    ConditionExpression: '#s = :expected',
-    ExpressionAttributeNames: { '#s': 'state' },
-    ExpressionAttributeValues: { ':expected': 'PRECOMMITTED' },
+    TableName: 'p-correlations',
+    Key: { correlationId: 'cor-1', version: 3 },
+    ConsistentRead: true,
   });
+  assert.deepEqual(doc.sent[2].input, tpcPut(rec, 'PRECOMMITTED'));
   // ...and that move is still conditional.
-  const lost = fakeDoc(async (cmd, n) => {
-    if (n === 1) throw cancelled('ConditionalCheckFailed', 'None');
+  const lost = historyExists(correlationItem(rec), async () => {
     const err = new Error('failed');
     err.name = 'ConditionalCheckFailedException';
     throw err;
   });
   await assert.rejects(createDynamoRepo({ doc: lost, tablePrefix: 'p-' }).tpcStore.commit(rec, { state: 'PRECOMMITTED' }), StoreConflict);
+});
+
+test('tpcStore.commit: the history row belongs to another tx → HistoryConflict, no state move (R3-1)', async () => {
+  const rec = commitRecord();
+  // Same business data or not: a different txId is never "already applied".
+  for (const other of [
+    { ...correlationItem(rec), txId: 'tx-other' },
+    { ...correlationItem(rec), txId: 'tx-other', incidentId: 'inc-other' },
+  ]) {
+    const doc = historyExists(other);
+    const repo = createDynamoRepo({ doc, tablePrefix: 'p-' });
+    await assert.rejects(repo.tpcStore.commit(rec, { state: 'PRECOMMITTED' }), (e) => {
+      assert.ok(e instanceof HistoryConflict);
+      assert.ok(!(e instanceof StoreConflict));
+      assert.equal(e.name, 'HistoryConflict');
+      assert.equal(e.txId, 'tx-1');
+      assert.equal(e.existingTxId, 'tx-other');
+      assert.equal(e.correlationId, 'cor-1');
+      assert.equal(e.version, 3);
+      return true;
+    });
+    assert.deepEqual(doc.sent.map((c) => c.type), ['TransactWriteCommand', 'GetCommand']);
+  }
+});
+
+test('tpcStore.commit: a legacy history row without txId must match incidentId, alertIds and decision (R3-1)', async () => {
+  const rec = commitRecord();
+  const { txId: _t, ...legacy } = correlationItem(rec);
+  // Same business fields (different key order and recordedAt): only the state moves.
+  const same = { ...legacy, recordedAt: '2026-01-01T00:00:00.000Z', decision: Object.fromEntries(Object.entries(legacy.decision).reverse()) };
+  const ok = historyExists(same);
+  await createDynamoRepo({ doc: ok, tablePrefix: 'p-' }).tpcStore.commit(rec, { state: 'PRECOMMITTED' });
+  assert.deepEqual(ok.sent.map((c) => c.type), ['TransactWriteCommand', 'GetCommand', 'PutCommand']);
+  // Any business field different → conflict, no state move.
+  for (const diff of [
+    { incidentId: 'inc-other' },
+    { alertIds: [...legacy.alertIds, 'another-alert'] },
+    { decision: { ...legacy.decision, severity: 'low' } },
+  ]) {
+    const doc = historyExists({ ...legacy, ...diff });
+    await assert.rejects(createDynamoRepo({ doc, tablePrefix: 'p-' }).tpcStore.commit(rec, { state: 'PRECOMMITTED' }), HistoryConflict, JSON.stringify(diff));
+    assert.equal(doc.sent.length, 2);
+  }
+});
+
+test('tpcStore.commit: the history row is gone by the time it is read → StoreConflict (re-read and retry)', async () => {
+  const doc = historyExists(undefined);
+  await assert.rejects(createDynamoRepo({ doc, tablePrefix: 'p-' }).tpcStore.commit(commitRecord(), { state: 'PRECOMMITTED' }), StoreConflict);
+  assert.equal(doc.sent.length, 2);
+});
+
+test("participant over a fake DynamoDB: another tx's history row → doCommit not acked, no state write, sweep leaves it pending (R3-1)", async () => {
+  let t = 2_000_000;
+  const prepared = { txId: 'tx-1', state: 'PRECOMMITTED', payload: commitRecord().payload, updatedAt: t };
+  const doc = fakeDoc(async (cmd) => {
+    const { TableName } = cmd.input;
+    switch (cmd.constructor.name) {
+      case 'GetCommand':
+        if (TableName === 'p-tpc') return { Item: structuredClone(prepared) };
+        return { Item: { ...correlationItem(commitRecord()), txId: 'tx-other', incidentId: 'inc-other' } };
+      case 'ScanCommand':
+        return { Items: [structuredClone(prepared)] };
+      case 'TransactWriteCommand':
+        throw cancelled('ConditionalCheckFailed', 'None');
+      default:
+        throw new Error(`unexpected ${cmd.constructor.name}`);
+    }
+  });
+  const repo = createDynamoRepo({ doc, tablePrefix: 'p-' });
+  const participant = createCorrelationParticipant({ store: repo.tpcStore, putCorrelation: repo.putCorrelation, timeoutMs: 1000, now: () => t, logger: silentLogger() });
+  await assert.rejects(participant.doCommit('tx-1'), HistoryConflict);
+  t += 5000;
+  assert.deepEqual(await participant.sweep(), { committed: [], aborted: [], pending: ['tx-1'] });
+  // Nothing ever wrote the tpc record: it is still PRECOMMITTED.
+  assert.ok(!doc.sent.some((c) => c.type === 'PutCommand'), doc.sent.map((c) => c.type).join());
 });
 
 test('tpcStore.commit: other failures are rethrown', async () => {
@@ -585,5 +674,59 @@ describe('dynamodb repo (integration)', { skip: !process.env.INTEGRATION }, () =
     await repo.tpcStore.commit(legacy, { state: 'PRECOMMITTED' });
     assert.equal((await repo.tpcStore.get(legacyId)).state, 'COMMITTED');
     assert.equal((await repo.getCorrelation(legacyCor)).length, 1);
+  });
+
+  test("R3-1: another tx's history row for the same (correlationId, version) → doCommit not acked, PRECOMMITTED, row unchanged", async () => {
+    let t = 6_000_000;
+    const participant = createCorrelationParticipant({
+      store: repo.tpcStore,
+      putCorrelation: repo.putCorrelation,
+      timeoutMs: 1000,
+      now: () => t,
+      logger: silentLogger(),
+    });
+    const correlationId = `cor-${randomUUID()}`;
+    const [a, b, c] = [randomUUID(), randomUUID(), randomUUID()];
+    // A commits version 1.
+    assert.equal(await participant.canCommit(a, correlationPayload({ correlationId, version: 1 })), 'yes');
+    await participant.preCommit(a);
+    await participant.doCommit(a);
+    const rowA = await repo.getCorrelation(correlationId);
+    // B claims the same version with a different incident.
+    assert.equal(await participant.canCommit(b, correlationPayload({ correlationId, version: 1 })), 'yes');
+    await participant.preCommit(b);
+    await assert.rejects(participant.doCommit(b), (e) => e instanceof HistoryConflict && e.existingTxId === a);
+    assert.equal((await repo.tpcStore.get(b)).state, 'PRECOMMITTED');
+    assert.deepEqual(await repo.getCorrelation(correlationId), rowA);
+    // The timeout sweep does not commit B either, and still resolves C.
+    assert.equal(await participant.canCommit(c, correlationPayload({ correlationId, version: 2 })), 'yes');
+    await participant.preCommit(c);
+    t += 5000;
+    const res = await participant.sweep();
+    assert.ok(res.pending.includes(b) && !res.committed.includes(b), JSON.stringify(res));
+    assert.ok(res.committed.includes(c), JSON.stringify(res));
+    assert.equal((await repo.tpcStore.get(b)).state, 'PRECOMMITTED');
+    assert.deepEqual((await repo.getCorrelation(correlationId)).map((r) => [r.version, r.txId]), [[1, a], [2, c]]);
+    // Leave B resolved so later sweeps in this suite skip it.
+    await participant.abort(b);
+  });
+
+  test('R3-1: a legacy history row without txId moves the state only when its business fields match', async () => {
+    const make = async (incidentId) => {
+      const correlationId = `cor-${randomUUID()}`;
+      const txId = randomUUID();
+      const payload = { ...correlationPayload({ correlationId, version: 1 }), txId };
+      const rec = { txId, state: 'COMMITTED', payload, updatedAt: 7_000_000 };
+      await repo.tpcStore.put({ ...rec, state: 'PRECOMMITTED' }, { state: null });
+      const { txId: _t, ...legacy } = correlationItem(rec);
+      assert.equal(await repo.putCorrelation({ ...legacy, incidentId: incidentId ?? legacy.incidentId }), 'stored');
+      return rec;
+    };
+    const same = await make();
+    await repo.tpcStore.commit(same, { state: 'PRECOMMITTED' });
+    assert.equal((await repo.tpcStore.get(same.txId)).state, 'COMMITTED');
+    const other = await make('inc-other');
+    await assert.rejects(repo.tpcStore.commit(other, { state: 'PRECOMMITTED' }), HistoryConflict);
+    assert.equal((await repo.tpcStore.get(other.txId)).state, 'PRECOMMITTED');
   });
 });

@@ -680,3 +680,33 @@ test('sweep: UNKNOWN without a logger still keeps PRECOMMITTED pending', async (
   assert.deepEqual(await p.sweep(), { committed: [], aborted: ['t1'], pending: ['t2'] });
   assert.equal(await stateOf(store, 't2'), 'PRECOMMITTED');
 });
+
+// --- R3-1: a commit the store refuses for good must not stop the sweep ---
+
+test('sweep: a commit that fails for one record leaves it PRECOMMITTED (pending, logged) and the sweep goes on', async () => {
+  const logger = recordingLogger();
+  const writes = [];
+  const inner = memoryStore({ businessWrites: writes });
+  const store = {
+    ...inner,
+    get: (id) => inner.get(id),
+    listPending: () => inner.listPending(),
+    put: (r, e) => inner.put(r, e),
+    commit: (r, e) => (r.txId === 'bad' ? Promise.reject(new Error('history row belongs to another tx')) : inner.commit(r, e)),
+  };
+  const clock = fakeClock();
+  const p = createParticipant({ store, validate: async () => true, timeoutMs: 1000, now: clock.now, logger });
+  for (const id of ['bad', 'good']) {
+    await p.canCommit(id, { id });
+    await p.preCommit(id);
+  }
+  await assert.rejects(p.doCommit('bad'), /another tx/);
+  clock.advance(1001);
+  assert.deepEqual(await p.sweep(), { committed: ['good'], aborted: [], pending: ['bad'] });
+  assert.equal((await inner.get('bad')).state, 'PRECOMMITTED');
+  assert.equal((await inner.get('good')).state, 'COMMITTED');
+  assert.deepEqual(writes.map((w) => w.txId), ['good']);
+  const errors = logger.lines.filter((l) => l.level === 'error');
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].obj.txId, 'bad');
+});
