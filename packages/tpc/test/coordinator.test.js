@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createCoordinator, createParticipant, CoordinatorCrash, TpcStateError } from '../src/index.js';
+import { createCoordinator, createParticipant, CoordinatorCrash, CoordinatorBusy, TpcStateError } from '../src/index.js';
 import { memoryLog, memoryStore } from './helpers.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -567,4 +567,182 @@ test('run() waits for a recovery that holds the same txId', async () => {
   assert.deepEqual(await recovering, ['tx1']);
   await running;
   assert.ok(trace.indexOf('a:abort') < trace.indexOf('a:canCommit'));
+});
+
+// --- R3-2: no unbounded waits ---
+// coordinator() uses timeoutMs 40, retries 5, retryDelayMs 1, so the default
+// lockWaitMs is 2 * 40 * 5 = 400 ms. Each test also has a hard timeout, so a
+// regression fails instead of hanging the suite.
+
+const never = () => new Promise(() => {});
+const BOUNDED = { timeout: 3000 };
+
+async function timed(promise) {
+  const start = Date.now();
+  const value = await promise;
+  return { value, ms: Date.now() - start };
+}
+
+test('a doCommit that never settles counts as a failed attempt; run() still returns (R3-2)', BOUNDED, async () => {
+  const trace = [];
+  const a = makeParticipant('a', trace, { hooks: { doCommit: never } });
+  const b = makeParticipant('b', trace);
+  const { c, log, committed } = coordinator([a, b]);
+  const { value, ms } = await timed(c.run('tx1', payloads));
+  assert.deepEqual(value, { outcome: 'committed', pending: ['a'] });
+  assert.equal(trace.filter((t) => t === 'a:doCommit').length, 5);
+  assert.ok(ms < 1000, `${ms} ms`);
+  assert.equal(log.map.get('tx1').state, 'PRECOMMITTED');
+  assert.equal(committed.length, 0);
+  assert.equal(await b.state('tx1'), 'COMMITTED');
+});
+
+test('recover() with an abort that never resolves finishes in bounded time (R3-2)', BOUNDED, async () => {
+  const trace = [];
+  const a = makeParticipant('a', trace, { hooks: { abort: never } });
+  const { c, log } = coordinator([a]);
+  await a.sm.canCommit('tx1', {});
+  await log.put({ txId: 'tx1', state: 'WAITING', payloads: { a: {} }, updatedAt: Date.now() });
+  const { value, ms } = await timed(c.recover());
+  assert.ok(ms < 1000, `${ms} ms`);
+  // The decision (abort) is logged before it is sent; the unacked participant
+  // learns it from the coordinator when its own sweep asks.
+  assert.deepEqual(value, ['tx1']);
+  assert.equal(log.map.get('tx1').state, 'ABORTED');
+  assert.equal(trace.filter((t) => t === 'a:abort').length, 5);
+  assert.equal(await a.state('tx1'), 'UNCERTAIN');
+  assert.deepEqual(await c.recover(), []);
+});
+
+test('recover() with a doCommit that never resolves leaves the entry PRECOMMITTED for the next pass (R3-2)', BOUNDED, async () => {
+  const trace = [];
+  let hung = true;
+  const a = makeParticipant('a', trace, {
+    hooks: {
+      doCommit: async () => {
+        if (hung) await never();
+      },
+    },
+  });
+  const { c, log, committed } = coordinator([a]);
+  await a.sm.canCommit('tx1', {});
+  await log.put({ txId: 'tx1', state: 'PRECOMMITTED', payloads: { a: {} }, updatedAt: Date.now() });
+  const { value, ms } = await timed(c.recover());
+  assert.ok(ms < 1000, `${ms} ms`);
+  assert.deepEqual(value, []);
+  assert.equal(log.map.get('tx1').state, 'PRECOMMITTED');
+  assert.equal(committed.length, 0);
+  hung = false;
+  assert.deepEqual(await c.recover(), ['tx1']);
+  assert.equal(log.map.get('tx1').state, 'COMMITTED');
+  assert.equal(await a.state('tx1'), 'COMMITTED');
+});
+
+test('a queued run() gives up waiting for the txId lock with CoordinatorBusy and writes nothing (R3-2)', BOUNDED, async () => {
+  const trace = [];
+  const a = makeParticipant('a', trace, { hooks: { abort: never } });
+  // Recovery holds tx1 for about 5 * 40 ms of abort timeouts; run() waits 60 ms at most.
+  const { c, log } = coordinator([a], { lockWaitMs: 60 });
+  await log.put({ txId: 'tx1', state: 'WAITING', payloads: { a: {} }, updatedAt: Date.now() });
+  const recovering = c.recover();
+  await sleep(1);
+  const start = Date.now();
+  await assert.rejects(c.run('tx1', { a: {} }), (err) => {
+    assert.ok(err instanceof CoordinatorBusy);
+    assert.equal(err.name, 'CoordinatorBusy');
+    assert.equal(err.txId, 'tx1');
+    return true;
+  });
+  const ms = Date.now() - start;
+  assert.ok(ms >= 50 && ms < 500, `${ms} ms`);
+  assert.deepEqual(c.inFlight(), []);
+  await recovering;
+  // Let recovery's abort attempts run out; the abandoned run() must never start.
+  await sleep(400);
+  assert.ok(!trace.includes('a:canCommit'), trace.join());
+  assert.deepEqual(log.history, ['tx1:WAITING', 'tx1:ABORTED']);
+});
+
+test('the default lockWaitMs is 2 * timeoutMs * retries (R3-2)', BOUNDED, async () => {
+  const trace = [];
+  const a = makeParticipant('a', trace);
+  const { log } = coordinator([a]);
+  let release;
+  const held = new Promise((r) => {
+    release = r;
+  });
+  // A coordinator log whose ABORTED write hangs: recovery holds tx1's lock.
+  const hangingLog = {
+    ...log,
+    async put(entry) {
+      if (entry.state === 'ABORTED') await held;
+      return log.put(entry);
+    },
+  };
+  const c = createCoordinator({ log: hangingLog, participants: [a.adapter], timeoutMs: 20, retries: 3, retryDelayMs: 1 });
+  await log.put({ txId: 'tx1', state: 'WAITING', payloads: { a: {} }, updatedAt: Date.now() });
+  const recovering = c.recover();
+  await sleep(1);
+  const start = Date.now();
+  await assert.rejects(c.run('tx1', { a: {} }), CoordinatorBusy);
+  const ms = Date.now() - start;
+  assert.ok(ms >= 110 && ms < 400, `${ms} ms (expected about 120)`);
+  release();
+  await recovering;
+});
+
+test('a coordinator-log write that hangs in recovery: the pass ends, the lock is kept until the write settles (R3-2)', BOUNDED, async () => {
+  const trace = [];
+  const a = makeParticipant('a', trace);
+  const { log } = coordinator([a]);
+  let release;
+  const held = new Promise((r) => {
+    release = r;
+  });
+  const hangingLog = {
+    ...log,
+    async put(entry) {
+      if (entry.txId === 'tx1' && entry.state === 'ABORTED') await held;
+      return log.put(entry);
+    },
+  };
+  const c = createCoordinator({ log: hangingLog, participants: [a.adapter], timeoutMs: 40, retryDelayMs: 1 });
+  await log.put({ txId: 'tx1', state: 'WAITING', payloads: { a: {} }, updatedAt: Date.now() });
+  await log.put({ txId: 'tx2', state: 'WAITING', payloads: { a: {} }, updatedAt: Date.now() });
+  // The pass gives up on tx1 after lockWaitMs (400 ms) and still finishes tx2.
+  const first = await timed(c.recover());
+  assert.ok(first.ms < 1000, `${first.ms} ms`);
+  assert.deepEqual(first.value, ['tx2']);
+  assert.equal(log.map.get('tx1').state, 'WAITING');
+  // tx1's write may still land, so its lock is still held: the next pass
+  // skips tx1 at once instead of acting on it again, and run() gets CoordinatorBusy.
+  const second = await timed(c.recover());
+  assert.ok(second.ms < 100, `${second.ms} ms`);
+  assert.deepEqual(second.value, []);
+  await assert.rejects(c.run('tx1', { a: {} }), CoordinatorBusy);
+  assert.equal(await a.state('tx1'), null);
+  // Once the write settles, the held-up recovery sends its abort and the lock is free.
+  release();
+  await sleep(20);
+  assert.equal(log.map.get('tx1').state, 'ABORTED');
+  assert.equal(await a.state('tx1'), 'ABORTED');
+  assert.deepEqual(await c.recover(), []);
+});
+
+test('recover() rejects in bounded time when listUnfinished hangs (R3-2)', BOUNDED, async () => {
+  const trace = [];
+  const a = makeParticipant('a', trace);
+  const { log } = coordinator([a]);
+  const c = createCoordinator({ log: { ...log, listUnfinished: never }, participants: [a.adapter], timeoutMs: 40, retryDelayMs: 1, lockWaitMs: 50 });
+  const start = Date.now();
+  await assert.rejects(c.recover(), /listUnfinished/);
+  assert.ok(Date.now() - start < 500);
+});
+
+test('CoordinatorBusy carries the txId and how long it waited', () => {
+  const e = new CoordinatorBusy('tx', 123);
+  assert.equal(e.name, 'CoordinatorBusy');
+  assert.equal(e.txId, 'tx');
+  assert.equal(e.waitedMs, 123);
+  assert.ok(e instanceof Error);
 });

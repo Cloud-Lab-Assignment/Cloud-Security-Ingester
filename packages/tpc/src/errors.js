@@ -34,3 +34,16 @@ export class StoreConflict extends Error {
     if (actual !== undefined) this.actual = actual;
   }
 }
+
+// run() gave up waiting for the per-txId lock (R3-2): another operation on the
+// same txId (usually recovery) still holds it after lockWaitMs. Nothing was
+// written for this call. Callers should treat it as retryable (gRPC
+// UNAVAILABLE): the transaction can be retried later.
+export class CoordinatorBusy extends Error {
+  constructor(txId, waitedMs) {
+    super(`tx ${txId}: coordinator busy, gave up waiting ${waitedMs} ms for the transaction lock`);
+    this.name = 'CoordinatorBusy';
+    this.txId = txId;
+    this.waitedMs = waitedMs;
+  }
+}

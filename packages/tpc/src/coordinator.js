@@ -1,4 +1,4 @@
-import { CoordinatorCrash, TpcStateError } from './errors.js';
+import { CoordinatorBusy, CoordinatorCrash, TpcStateError } from './errors.js';
 
 export const WAITING = 'WAITING';
 
@@ -20,6 +20,35 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 //
 // Log contract: put(entry), listUnfinished() -> WAITING/PRECOMMITTED entries,
 // get(txId) -> entry | null. Entries are {txId, state, payloads, updatedAt, reason?}.
+//
+// Deadlines (R3-2). No caller waits unboundedly:
+//  - Every participant call (canCommit, preCommit, doCommit, abort) is raced
+//    against timeoutMs; for doCommit/abort a timeout is a failed attempt and
+//    is retried, up to `retries` attempts.
+//  - run() waits at most lockWaitMs (default 2 * timeoutMs * retries) for its
+//    txId's lock, then rejects with CoordinatorBusy without writing anything.
+//  - recover() waits at most lockWaitMs for listUnfinished() and for each
+//    transaction, then moves on; it skips txIds whose lock is held.
+//
+// What a deadline does NOT do is release the lock early. The lock guards the
+// coordinator log entry of its txId, and is held until the guarded work has
+// really settled, including a log call that hangs (bounded in practice only
+// by the log's own client timeouts). So a log write that lands late can never
+// interleave with the next holder. Waiters give up instead (CoordinatorBusy,
+// or recovery skipping the txId until a later pass). For the same reason the
+// log calls of a run() that holds the lock are not raced either: its caller
+// waits for them, bounded by the log client's timeouts.
+// Timed-out participant calls are different: the coordinator stops waiting
+// for them and may release the lock while they are still in flight. That is
+// safe because the lock does not guard participant state: each participant
+// serialises its own messages per txId and writes conditionally on the state
+// it read, and the coordinator logs a decision before sending it (ABORTED
+// before abort, PRECOMMITTED before preCommit, all acks before doCommit). A
+// late message therefore either moves the participant towards the logged
+// decision or is refused by its state machine (e.g. a late canCommit after
+// the abort tombstone votes no, a late preCommit on ABORTED is a
+// TpcStateError), and a participant left undecided asks the coordinator from
+// its sweep.
 export function createCoordinator({
   log,
   participants,
@@ -30,6 +59,7 @@ export function createCoordinator({
   logger,
   retries = 5,
   retryDelayMs = 200,
+  lockWaitMs = 2 * timeoutMs * retries,
 }) {
   const write = (txId, state, payloads, extra = {}) => log.put({ txId, state, payloads, updatedAt: now(), ...extra });
 
@@ -42,7 +72,8 @@ export function createCoordinator({
       participants.map(async (p) => {
         for (let attempt = 1; attempt <= retries; attempt += 1) {
           try {
-            await p[phase](txId);
+            const r = await withTimeout(Promise.resolve().then(() => p[phase](txId)), timeoutMs);
+            if (r === TIMEOUT) throw new Error(`${phase} timed out after ${timeoutMs} ms`);
             return;
           } catch (err) {
             if (err instanceof TpcStateError && ackStates.includes(err.state)) return;
@@ -86,17 +117,32 @@ export function createCoordinator({
 
   // Per-txId mutex (R2-1): run() holds it for its whole duration and
   // recovery while it handles that txId, so recovery never acts on a log
-  // entry that run() is changing underneath it.
+  // entry that run() is changing underneath it. The holder keeps it until
+  // fn() has settled. With `waitMs`, the caller waits at most that long for
+  // the previous holder (R3-2): it then rejects with CoordinatorBusy and fn
+  // never runs (the queue position is kept, so later waiters stay ordered).
   const locks = new Map();
-  function withLock(txId, fn) {
-    const prev = locks.get(txId) ?? Promise.resolve();
-    const result = prev.then(fn, fn);
+  function withLock(txId, fn, waitMs) {
+    const prev = locks.get(txId) ?? Promise.resolve(); // tails never reject
+    let abandoned = false;
+    const result = prev.then(() => (abandoned ? undefined : fn()));
     const tail = result.catch(() => {});
     locks.set(txId, tail);
     tail.then(() => {
       if (locks.get(txId) === tail) locks.delete(txId);
     });
-    return result;
+    if (waitMs === undefined) return result;
+    let timer;
+    const gaveUp = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        // prev has not settled (its callbacks would have run before any
+        // timer), so fn has not started and now never will.
+        abandoned = true;
+        reject(new CoordinatorBusy(txId, waitMs));
+      }, waitMs);
+    });
+    prev.then(() => clearTimeout(timer));
+    return Promise.race([result, gaveUp]);
   }
 
   // txIds a run() in this process is driving right now. recover() skips them
@@ -107,7 +153,7 @@ export function createCoordinator({
   async function run(txId, payloads) {
     inFlight.add(txId);
     try {
-      return await withLock(txId, () => drive(txId, payloads));
+      return await withLock(txId, () => drive(txId, payloads), lockWaitMs);
     } finally {
       inFlight.delete(txId);
     }
@@ -178,10 +224,23 @@ export function createCoordinator({
     const finished = [];
     // Only a list of candidates: each entry is re-read under its lock before
     // anything is done, because the snapshot can be stale by then (R2-1).
-    const entries = await log.listUnfinished();
+    const entries = await withTimeout(Promise.resolve().then(() => log.listUnfinished()), lockWaitMs);
+    if (entries === TIMEOUT) throw new Error(`coordinator log listUnfinished timed out after ${lockWaitMs} ms`);
     for (const { txId } of entries) {
       if (inFlight.has(txId)) continue;
-      if (await withLock(txId, () => recoverTx(txId))) finished.push(txId);
+      // Held by an earlier operation still in flight (e.g. a hung log write
+      // from a previous pass): leave it for a later pass, do not queue (R3-2).
+      if (locks.has(txId)) {
+        logger?.warn({ txId }, '3pc recovery skipped: transaction still locked by an unfinished operation');
+        continue;
+      }
+      const done = await withTimeout(withLock(txId, () => recoverTx(txId)), lockWaitMs);
+      if (done === TIMEOUT) {
+        // recoverTx goes on in the background and keeps the lock until it settles.
+        logger?.error({ txId, waitedMs: lockWaitMs }, '3pc recovery gave up waiting on a transaction; retrying on a later pass');
+        continue;
+      }
+      if (done) finished.push(txId);
     }
     return finished;
   }
