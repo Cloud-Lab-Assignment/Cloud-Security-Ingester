@@ -141,7 +141,7 @@ test('sweep aborts UNCERTAIN older than timeoutMs', async () => {
   await p.canCommit('t1', {});
   clock.advance(1001);
   const res = await p.sweep();
-  assert.deepEqual(res, { committed: [], aborted: ['t1'] });
+  assert.deepEqual(res, { committed: [], aborted: ['t1'], pending: [] });
   assert.equal((await store.get('t1')).state, 'ABORTED');
   assert.equal(applied.length, 0);
 });
@@ -152,7 +152,7 @@ test('sweep commits PRECOMMITTED older than timeoutMs', async () => {
   await p.preCommit('t1');
   clock.advance(1001);
   const res = await p.sweep();
-  assert.deepEqual(res, { committed: ['t1'], aborted: [] });
+  assert.deepEqual(res, { committed: ['t1'], aborted: [], pending: [] });
   assert.equal((await store.get('t1')).state, 'COMMITTED');
   assert.deepEqual(applied, [{ y: 2 }]);
 });
@@ -163,7 +163,7 @@ test('sweep leaves fresh records alone', async () => {
   await p.canCommit('t2', {});
   await p.preCommit('t2');
   clock.advance(999);
-  assert.deepEqual(await p.sweep(), { committed: [], aborted: [] });
+  assert.deepEqual(await p.sweep(), { committed: [], aborted: [], pending: [] });
   assert.equal((await store.get('t1')).state, 'UNCERTAIN');
   assert.equal((await store.get('t2')).state, 'PRECOMMITTED');
 });
@@ -174,7 +174,7 @@ test('preCommit refreshes the timeout clock', async () => {
   clock.advance(900);
   await p.preCommit('t1');
   clock.advance(900);
-  assert.deepEqual(await p.sweep(), { committed: [], aborted: [] });
+  assert.deepEqual(await p.sweep(), { committed: [], aborted: [], pending: [] });
   assert.equal((await store.get('t1')).state, 'PRECOMMITTED');
 });
 
@@ -314,7 +314,7 @@ test('race: sweep-abort on another replica beats preCommit → TpcStateError ABO
   await a.canCommit('t1', {});
   clock.advance(1001);
   view.beforeNextPut(async () => {
-    assert.deepEqual(await b.sweep(), { committed: [], aborted: ['t1'] });
+    assert.deepEqual(await b.sweep(), { committed: [], aborted: ['t1'], pending: [] });
   });
   await assert.rejects(a.preCommit('t1'), (e) => e instanceof TpcStateError && e.state === 'ABORTED');
   assert.equal((await shared.get('t1')).state, 'ABORTED');
@@ -325,7 +325,7 @@ test('race: preCommit on another replica beats a sweep-abort → record stays PR
   await b.canCommit('t1', {});
   clock.advance(1001);
   view.beforeNextPut(() => b.preCommit('t1'));
-  assert.deepEqual(await a.sweep(), { committed: [], aborted: [] });
+  assert.deepEqual(await a.sweep(), { committed: [], aborted: [], pending: [] });
   assert.equal((await shared.get('t1')).state, 'PRECOMMITTED');
 });
 
@@ -372,4 +372,105 @@ test('persistent conflicts are retried a bounded number of times, then rethrown'
   const p = createParticipant({ store, validate: async () => true, apply: async () => {}, timeoutMs: 1000 });
   await assert.rejects(p.canCommit('t1', {}), StoreConflict);
   assert.equal(puts, 3);
+});
+
+// --- Coordinator-decision lookup before acting on a timeout (P0-4) ---
+
+// t1 is left UNCERTAIN and t2 PRECOMMITTED, both past the timeout.
+async function expired(resolve, extra = {}) {
+  const ctx = setup({ resolve, ...extra });
+  await ctx.p.canCommit('t1', { n: 1 });
+  await ctx.p.canCommit('t2', { n: 2 });
+  await ctx.p.preCommit('t2');
+  ctx.clock.advance(1001);
+  return ctx;
+}
+
+const stateOf = async (store, txId) => (await store.get(txId)).state;
+
+test('sweep: coordinator says COMMITTED → commit from PRECOMMITTED and from UNCERTAIN', async () => {
+  const asked = [];
+  const { p, store, applied } = await expired(async (txId) => {
+    asked.push(txId);
+    return 'COMMITTED';
+  });
+  const res = await p.sweep();
+  assert.deepEqual(res, { committed: ['t1', 't2'], aborted: [], pending: [] });
+  assert.deepEqual(asked.sort(), ['t1', 't2']);
+  assert.equal(await stateOf(store, 't1'), 'COMMITTED');
+  assert.equal(await stateOf(store, 't2'), 'COMMITTED');
+  assert.deepEqual(applied, [{ n: 1 }, { n: 2 }]);
+});
+
+test('sweep: coordinator says ABORTED → abort, even a PRECOMMITTED record', async () => {
+  const { p, store, applied } = await expired(async () => 'ABORTED');
+  assert.deepEqual(await p.sweep(), { committed: [], aborted: ['t1', 't2'], pending: [] });
+  assert.equal(await stateOf(store, 't1'), 'ABORTED');
+  assert.equal(await stateOf(store, 't2'), 'ABORTED');
+  assert.equal(applied.length, 0);
+});
+
+test('sweep: coordinator says PENDING → records left untouched', async () => {
+  const { p, store, applied } = await expired(async () => 'PENDING');
+  const before = [await store.get('t1'), await store.get('t2')];
+  assert.deepEqual(await p.sweep(), { committed: [], aborted: [], pending: ['t1', 't2'] });
+  assert.deepEqual([await store.get('t1'), await store.get('t2')], before);
+  assert.equal(applied.length, 0);
+});
+
+test('sweep: unknown / failing / odd coordinator answers fall back to the timeout rule', async () => {
+  const answers = [
+    async () => null,
+    async () => {
+      throw new Error('ECONNREFUSED');
+    },
+    async () => 'WAITING',
+    () => {
+      throw new Error('sync throw');
+    },
+  ];
+  for (const resolve of answers) {
+    const { p, store, applied } = await expired(resolve);
+    assert.deepEqual(await p.sweep(), { committed: ['t2'], aborted: ['t1'], pending: [] });
+    assert.equal(await stateOf(store, 't1'), 'ABORTED');
+    assert.equal(await stateOf(store, 't2'), 'COMMITTED');
+    assert.deepEqual(applied, [{ n: 2 }]);
+  }
+});
+
+test('sweep: a coordinator lookup that hangs counts as unreachable', async () => {
+  const { p, store } = await expired(() => new Promise(() => {}), { resolveTimeoutMs: 20 });
+  assert.deepEqual(await p.sweep(), { committed: ['t2'], aborted: ['t1'], pending: [] });
+  assert.equal(await stateOf(store, 't1'), 'ABORTED');
+});
+
+test('sweep: the coordinator is not asked about fresh records', async () => {
+  const asked = [];
+  const { p, clock } = setup({
+    resolve: async (txId) => {
+      asked.push(txId);
+      return 'ABORTED';
+    },
+  });
+  await p.canCommit('t1', {});
+  clock.advance(999);
+  assert.deepEqual(await p.sweep(), { committed: [], aborted: [], pending: [] });
+  assert.deepEqual(asked, []);
+});
+
+test('sweep: a record decided while the coordinator was being asked is left alone', async () => {
+  let p;
+  const ctx = setup({
+    resolve: async (txId) => {
+      await p.abort(txId); // the coordinator's abort arrives meanwhile
+      return 'COMMITTED';
+    },
+  });
+  p = ctx.p;
+  await p.canCommit('t1', {});
+  await p.preCommit('t1');
+  ctx.clock.advance(1001);
+  assert.deepEqual(await p.sweep(), { committed: [], aborted: [], pending: [] });
+  assert.equal(await stateOf(ctx.store, 't1'), 'ABORTED');
+  assert.equal(ctx.applied.length, 0);
 });

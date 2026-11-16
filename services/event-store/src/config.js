@@ -21,5 +21,9 @@ export function loadConfig() {
     tablePrefix: envStr('TABLE_PREFIX', 'cs-'),
     tpcTimeoutMs: envInt('TPC_TIMEOUT_MS', 10_000),
     tpcForceVote: forceVote,
+    // 3PC coordinator (incident-management) asked for its decision before a
+    // timed-out transaction is resolved locally. Empty string disables it.
+    coordinatorUrl: process.env.COORDINATOR_URL ?? 'http://localhost:8082',
+    coordinatorTimeoutMs: envInt('COORDINATOR_TIMEOUT_MS', 2000),
   };
 }

@@ -410,3 +410,51 @@ test('concurrent recover() calls do not overlap: the second joins the first', as
   // Once finished, a new call runs again.
   assert.deepEqual(await r.recover(), []);
 });
+
+test('participant PRECOMMITTED but crashed before acking; coordinator aborted → sweep asks and aborts (case a)', async () => {
+  const trace = [];
+  const a = makeParticipant('a', trace);
+  // b persists PRECOMMITTED, then "crashes": the ack is lost and b stays
+  // unreachable for the coordinator's abort.
+  let bDown = false;
+  const bStore = memoryStore();
+  const bApplied = [];
+  const { log } = coordinator([]);
+  const decision = async (txId) => {
+    const s = log.map.get(txId)?.state;
+    if (s === 'COMMITTED' || s === 'ABORTED') return s;
+    return s ? 'PENDING' : null;
+  };
+  let t = Date.now();
+  const bSm = createParticipant({
+    store: bStore,
+    validate: async () => true,
+    apply: async (p) => bApplied.push(p),
+    timeoutMs: 1000,
+    now: () => t,
+    resolve: decision,
+  });
+  const b = {
+    name: 'b',
+    canCommit: (...args) => bSm.canCommit(...args),
+    preCommit: async (txId) => {
+      await bSm.preCommit(txId);
+      bDown = true;
+      throw new Error('crashed before ack');
+    },
+    doCommit: (txId) => (bDown ? Promise.reject(new Error('down')) : bSm.doCommit(txId)),
+    abort: (txId) => (bDown ? Promise.reject(new Error('down')) : bSm.abort(txId)),
+  };
+  const c = createCoordinator({ log, participants: [a.adapter, b], timeoutMs: 40, retryDelayMs: 1, now: Date.now });
+  assert.deepEqual(await c.run('tx1', payloads), { outcome: 'aborted', reason: 'precommit_failed' });
+  assert.equal(log.map.get('tx1').state, 'ABORTED');
+  assert.equal(await a.state('tx1'), 'ABORTED');
+  assert.equal((await bStore.get('tx1')).state, 'PRECOMMITTED');
+
+  // b restarts; its PRECOMMITTED timeout expires. Without the lookup it would
+  // self-commit (a split). With it, it follows the coordinator's abort.
+  t += 5000;
+  assert.deepEqual(await bSm.sweep(), { committed: [], aborted: ['tx1'], pending: [] });
+  assert.equal((await bStore.get('tx1')).state, 'ABORTED');
+  assert.equal(bApplied.length, 0);
+});

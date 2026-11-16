@@ -27,12 +27,24 @@ export function validateCorrelationPayload(p) {
 
 // 3PC participant for correlation-history writes. The txId is folded into the
 // stored payload at canCommit, so apply (which only sees the payload) can record it.
-export function createCorrelationParticipant({ store, putCorrelation, timeoutMs, forceVote, now = Date.now }) {
+// `resolve` (optional) asks the coordinator for its decision before the sweeper
+// acts on a timed-out transaction (see coordinator-client.js).
+export function createCorrelationParticipant({
+  store,
+  putCorrelation,
+  timeoutMs,
+  forceVote,
+  now = Date.now,
+  resolve,
+  resolveTimeoutMs,
+}) {
   const participant = createParticipant({
     store,
     timeoutMs,
     forceVote,
     now,
+    resolve,
+    resolveTimeoutMs,
     validate: async (txId, payload) => validateCorrelationPayload(payload),
     apply: async ({ txId, ...payload }) => {
       await putCorrelation({ ...payload, txId, recordedAt: isoTimestamp(now()) });

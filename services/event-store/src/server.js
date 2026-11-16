@@ -5,6 +5,7 @@ import { createS3Client, createS3Archive } from './s3-archive.js';
 import { ensureLocalResources } from './local-setup.js';
 import { startConsumers } from './consumers.js';
 import { createCorrelationParticipant } from './participant.js';
+import { createCoordinatorClient } from './coordinator-client.js';
 import { buildServer } from './routes.js';
 
 const SWEEP_INTERVAL_MS = 2000;
@@ -24,6 +25,12 @@ async function main() {
     putCorrelation: repo.putCorrelation,
     timeoutMs: config.tpcTimeoutMs,
     forceVote: config.tpcForceVote,
+    resolve: createCoordinatorClient({
+      url: config.coordinatorUrl,
+      timeoutMs: config.coordinatorTimeoutMs,
+      logger,
+    }),
+    resolveTimeoutMs: config.coordinatorTimeoutMs + 1000,
   });
 
   let consumers = null;
@@ -49,14 +56,18 @@ async function main() {
 
   await app.listen({ host: '0.0.0.0', port: config.port });
 
-  // Participant-side 3PC timeouts: UNCERTAIN -> ABORTED, PRECOMMITTED -> COMMITTED.
+  // Participant-side 3PC timeouts. Each timed-out record first asks the
+  // coordinator (COORDINATOR_URL) for its decision; only when it has none
+  // (unreachable/unknown) does the timeout rule apply: UNCERTAIN -> ABORTED,
+  // PRECOMMITTED -> COMMITTED. The first sweep after a restart works the same way.
   let sweeping = false;
   const sweepTimer = setInterval(async () => {
     if (sweeping) return;
     sweeping = true;
     try {
-      const { committed, aborted } = await participant.sweep();
+      const { committed, aborted, pending } = await participant.sweep();
       if (committed.length || aborted.length) logger.info({ committed, aborted }, '3pc sweep resolved transactions');
+      if (pending.length) logger.debug({ pending }, '3pc sweep: coordinator still deciding');
     } catch (err) {
       logger.error({ err }, '3pc sweep failed');
     } finally {

@@ -12,7 +12,12 @@ export const ABORTED = 'ABORTED';
 //   preCommit  UNCERTAIN      -> PRECOMMITTED
 //   doCommit   PRECOMMITTED   -> apply, COMMITTED
 //   abort      UNCERTAIN|PRECOMMITTED|unknown -> ABORTED
-//   sweep: UNCERTAIN past timeout -> ABORTED; PRECOMMITTED past timeout -> apply, COMMITTED
+//   sweep: for each UNCERTAIN/PRECOMMITTED record past timeoutMs, first ask
+//          the coordinator (optional `resolve(txId)`) for its decision:
+//            'COMMITTED' -> apply, COMMITTED   'ABORTED' -> ABORTED
+//            'PENDING'   -> untouched (the coordinator is alive and will finish it)
+//            null / error / no answer within resolveTimeoutMs -> timeout rule:
+//              UNCERTAIN -> ABORTED; PRECOMMITTED -> apply, COMMITTED
 //
 // Store contract: get(txId), listPending(), put(record, expected). Every put
 // passes the state this participant read ({state: null} = "must not exist");
@@ -22,7 +27,18 @@ export const ABORTED = 'ABORTED';
 // two replicas can both apply a commit before one of them loses the write.
 const CONFLICT_ATTEMPTS = 3;
 
-export function createParticipant({ store, validate, apply, timeoutMs, now = Date.now, forceVote }) {
+const DECISIONS = new Set([COMMITTED, ABORTED, 'PENDING']);
+
+export function createParticipant({
+  store,
+  validate,
+  apply,
+  timeoutMs,
+  now = Date.now,
+  forceVote,
+  resolve,
+  resolveTimeoutMs = 5000,
+}) {
   // Serialise work per txId inside this process so concurrent messages
   // (e.g. a doCommit racing the sweeper) cannot apply twice.
   const locks = new Map();
@@ -106,25 +122,56 @@ export function createParticipant({ store, validate, apply, timeoutMs, now = Dat
     });
   }
 
+  // The coordinator's decision for txId, or null when it cannot be had.
+  async function decisionFor(txId) {
+    if (!resolve) return null;
+    let timer;
+    try {
+      const answer = await Promise.race([
+        Promise.resolve().then(() => resolve(txId)),
+        new Promise((r) => {
+          timer = setTimeout(() => r(null), resolveTimeoutMs);
+        }),
+      ]);
+      return DECISIONS.has(answer) ? answer : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  const expired = (rec) => now() - rec.updatedAt > timeoutMs;
+  const undecided = (rec) => rec?.state === UNCERTAIN || rec?.state === PRECOMMITTED;
+
   async function sweep() {
     const committed = [];
     const aborted = [];
-    const pending = await store.listPending();
-    for (const candidate of pending) {
-      if (now() - candidate.updatedAt <= timeoutMs) continue;
+    const pending = [];
+    const candidates = await store.listPending();
+    for (const candidate of candidates) {
+      if (!expired(candidate)) continue;
+      // Asked outside the per-tx lock so doCommit/abort messages are not held
+      // up. A COMMITTED/ABORTED decision is final, so it stays valid below.
+      const decision = await decisionFor(candidate.txId);
+      if (decision === 'PENDING') {
+        pending.push(candidate.txId);
+        continue;
+      }
       await operation(candidate.txId, async () => {
         const rec = await store.get(candidate.txId);
-        if (!rec || now() - rec.updatedAt <= timeoutMs) return;
-        if (rec.state === UNCERTAIN) {
-          await record(rec.txId, ABORTED, rec.payload, UNCERTAIN);
-          aborted.push(rec.txId);
-        } else if (rec.state === PRECOMMITTED) {
+        if (!undecided(rec) || !expired(rec)) return;
+        const commit = decision === COMMITTED || (decision === null && rec.state === PRECOMMITTED);
+        if (commit) {
           await commitRecord(rec);
           committed.push(rec.txId);
+        } else {
+          await record(rec.txId, ABORTED, rec.payload, rec.state);
+          aborted.push(rec.txId);
         }
       });
     }
-    return { committed, aborted };
+    return { committed, aborted, pending };
   }
 
   return { canCommit, preCommit, doCommit, abort, sweep };
