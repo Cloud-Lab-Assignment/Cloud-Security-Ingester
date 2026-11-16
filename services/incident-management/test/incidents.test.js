@@ -67,7 +67,7 @@ after(async () => {
 test('migrate is idempotent', { skip }, async () => {
   assert.deepEqual(await migrate(db.pool), []);
   const { rows } = await db.pool.query('SELECT name FROM schema_migrations');
-  assert.deepEqual(rows.map((r) => r.name).sort(), ['001_init.sql', '002_outbox.sql']);
+  assert.deepEqual(rows.map((r) => r.name).sort(), ['001_init.sql', '002_outbox.sql', '003_alert_unique.sql']);
 });
 
 test('upsertIncident commits to postgres and event-store and queues incident.created', { skip }, async () => {
@@ -229,11 +229,14 @@ test('findTarget falls back to open incident for same entity inside window', { s
   const c = candidate();
   const { incident } = await svc.upsertIncident(c);
 
-  const inside = await repo.findTarget({ ...c, correlationId: 'cor-other', firstSeen: '2026-11-16T09:10:00.000Z' });
+  // Probes carry an alert nobody owns yet, so they exercise the window fallback
+  // (an alert that is already owned short-circuits to its owner, P2-1).
+  const probe = { ...c, correlationId: 'cor-other', alertIds: [`${c.alertIds[0]}-probe`] };
+  const inside = await repo.findTarget({ ...probe, firstSeen: '2026-11-16T09:10:00.000Z' });
   assert.equal(inside.existing?.incidentId, incident.incidentId);
   assert.ok(inside.knownAlertIds.has(c.alertIds[0]));
 
-  const outside = await repo.findTarget({ ...c, correlationId: 'cor-other', firstSeen: '2026-11-16T09:20:00.001Z' });
+  const outside = await repo.findTarget({ ...probe, firstSeen: '2026-11-16T09:20:00.001Z' });
   assert.equal(outside.existing, null);
 
   // A rebalanced engine's candidate merges into the stored incident and keeps its correlationId.
@@ -242,7 +245,7 @@ test('findTarget falls back to open incident for same entity inside window', { s
   assert.equal(res.incident.correlationId, c.correlationId);
 
   await repo.updateStatus(incident.incidentId, { status: 'resolved', version: res.incident.version });
-  const resolved = await repo.findTarget({ ...c, correlationId: 'cor-other', firstSeen: '2026-11-16T09:10:00.000Z' });
+  const resolved = await repo.findTarget({ ...probe, firstSeen: '2026-11-16T09:10:00.000Z' });
   assert.equal(resolved.existing, null, 'resolved incidents are not reopened by fallback');
 });
 
@@ -454,4 +457,37 @@ test('periodic recovery finishes a transaction deferred while a participant was 
   await loop.stop();
   assert.equal(state, 'COMMITTED');
   assert.equal((await db.pool.query('SELECT 1 FROM incidents WHERE correlation_id = $1', [c.correlationId])).rowCount, 1);
+});
+
+test('redelivered alert after restart + resolve is a noop, not a duplicate incident (P2-1)', { skip }, async () => {
+  const { svc } = service();
+  const c = candidate();
+  const a0 = c.alertIds[0];
+  const a1 = `${a0}-second`;
+  const first = await svc.upsertIncident({ ...c, alertIds: [a0, a1] });
+  await repo.updateStatus(first.incident.incidentId, { status: 'resolved', version: first.incident.version });
+
+  // A restarted correlation engine re-opens a group with a1 only: new correlationId,
+  // and the entity fallback skips the resolved incident.
+  const redelivered = { ...c, correlationId: `${c.correlationId}-restart`, alertIds: [a1] };
+  const res = await svc.upsertIncident(redelivered);
+  assert.equal(res.outcome, 'noop');
+  assert.equal(res.incident.incidentId, first.incident.incidentId);
+  const all = await repo.listIncidents({ entityKey: c.entityKey, limit: 500 });
+  assert.equal(all.length, 1, 'no duplicate incident');
+});
+
+test('a new incident never takes over alerts another incident owns (P2-1)', { skip }, async () => {
+  const { svc } = service();
+  const c = candidate();
+  const a0 = c.alertIds[0];
+  const first = await svc.upsertIncident(c);
+  await repo.updateStatus(first.incident.incidentId, { status: 'resolved', version: 1 });
+  const res = await svc.upsertIncident({ ...c, correlationId: `${c.correlationId}-new`, alertIds: [a0, `${a0}-fresh`] });
+  assert.equal(res.outcome, 'created');
+  assert.notEqual(res.incident.incidentId, first.incident.incidentId);
+  assert.deepEqual(res.incident.alertIds, [`${a0}-fresh`]);
+  assert.equal(res.incident.alertCount, 1);
+  const owners = await db.pool.query('SELECT count(*)::int AS n FROM incident_alerts WHERE alert_id = $1', [a0]);
+  assert.equal(owners.rows[0].n, 1);
 });

@@ -45,15 +45,20 @@ export function mergeCandidate(existing, knownAlertIds, candidate, { now = Date.
   const candidateAlerts = union(candidate.alertIds ?? []);
 
   if (!existing) {
+    // Only alerts no other incident owns (P2-1); knownAlertIds is empty for a brand-new entity.
+    const fresh = candidateAlerts.filter((id) => !knownAlertIds.has(id));
     const incident = {
       incidentId: newId(),
       correlationId: candidate.correlationId,
       entityKey: candidate.entityKey,
-      title: candidate.title || titleFor(candidateAlerts.length, candidate.entityKey),
+      title:
+        fresh.length === candidateAlerts.length && candidate.title
+          ? candidate.title
+          : titleFor(fresh.length, candidate.entityKey),
       severity: candidate.severity,
       status: 'open',
-      alertIds: candidateAlerts,
-      alertCount: candidateAlerts.length,
+      alertIds: fresh,
+      alertCount: fresh.length,
       eventCount: candidate.eventCount ?? 0,
       ruleIds: union(candidate.ruleIds ?? []),
       relatedEventIds: union(candidate.relatedEventIds ?? []).slice(0, MAX_RELATED_EVENTS),
@@ -65,7 +70,7 @@ export function mergeCandidate(existing, knownAlertIds, candidate, { now = Date.
       createdAt: ts,
       updatedAt: ts,
     };
-    return { kind: 'create', incident, newAlertIds: candidateAlerts };
+    return { kind: 'create', incident, newAlertIds: fresh };
   }
 
   const newAlertIds = candidateAlerts.filter((id) => !knownAlertIds.has(id));
@@ -130,6 +135,19 @@ export function createIncidentRepo({ pool, correlationWindowMs, now = Date.now }
   // open/investigating incident for the same entity still inside the window
   // (covers correlation-engine rebalances, where in-memory groups are lost).
   async function findTarget(candidate, db = pool) {
+    // Alerts are owned by at most one incident (P2-1). If every alert of the
+    // candidate already has an owner, this is a redelivery: noop on the owner,
+    // even if it is resolved or its correlationId differs (engine restart).
+    const candidateAlerts = [...new Set(candidate.alertIds ?? [])];
+    const owned = await db.query('SELECT alert_id, incident_id FROM incident_alerts WHERE alert_id = ANY($1::text[])', [
+      candidateAlerts,
+    ]);
+    const ownedIds = new Set(owned.rows.map((r) => r.alert_id));
+    if (candidateAlerts.length > 0 && ownedIds.size === candidateAlerts.length) {
+      const owner = await getIncident(owned.rows.find((r) => r.alert_id === candidateAlerts[0]).incident_id, db);
+      return { existing: owner, knownAlertIds: new Set([...owner.alertIds, ...ownedIds]) };
+    }
+
     let { rows } = await db.query('SELECT * FROM incidents WHERE correlation_id = $1', [candidate.correlationId]);
     if (rows.length === 0) {
       // The incident's [first_seen, last_seen] must overlap the candidate's
@@ -144,9 +162,10 @@ export function createIncidentRepo({ pool, correlationWindowMs, now = Date.now }
         [candidate.entityKey, since, until],
       ));
     }
-    if (rows.length === 0) return { existing: null, knownAlertIds: new Set() };
+    // Alerts owned by another incident count as known, so they are never merged twice.
+    if (rows.length === 0) return { existing: null, knownAlertIds: ownedIds };
     const alertIds = await alertIdsFor(db, rows[0].incident_id);
-    return { existing: rowToIncident(rows[0], alertIds), knownAlertIds: new Set(alertIds) };
+    return { existing: rowToIncident(rows[0], alertIds), knownAlertIds: new Set([...alertIds, ...ownedIds]) };
   }
 
   async function listIncidents({ status, severity, entityKey, limit = 50 } = {}) {
