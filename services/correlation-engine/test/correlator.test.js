@@ -139,3 +139,41 @@ test('different entities never share a group', () => {
   assert.equal(d.alertIds.length, 1);
   assert.equal(b.entityKey, '2001:db8::1');
 });
+
+test('groups whose window closed more than 2 windows ago are evicted with their alertIds', () => {
+  // wall clock far ahead, so only alert times drive the watermark
+  const c = createCorrelator({ windowMs: WINDOW, escalateCount: 3, now: () => Date.parse(at(10_000)) });
+  const a = makeAlert({ entityKey: '203.0.113.10', minutes: 0 });
+  const b = makeAlert({ entityKey: '203.0.113.11', minutes: 1 });
+  const first = c.ingest(a);
+  c.ingest(b);
+  c.ingest(makeAlert({ entityKey: '203.0.113.12', minutes: 45 }));
+  // a's window closed at 15, exactly 2 windows before 45: kept
+  assert.deepEqual(c.stats(), { groups: 3, alerts: 3 });
+  assert.equal(c.ingest(a), null);
+
+  c.ingest(makeAlert({ entityKey: '203.0.113.12', minutes: 46 }));
+  // a's window closed 31 min (> 2 windows) before 46: evicted; b's closed at 16: kept
+  assert.deepEqual(c.stats(), { groups: 2, alerts: 3 });
+  c.ingest(makeAlert({ entityKey: '203.0.113.12', minutes: 47 }));
+  assert.deepEqual(c.stats(), { groups: 1, alerts: 3 });
+
+  // the alertId was dropped too: a redelivery is ingested again (durable dedupe
+  // in incident-management is the safety net) and gets the same correlationId
+  const again = c.ingest(a);
+  assert.ok(again);
+  assert.equal(again.correlationId, first.correlationId);
+  assert.deepEqual(again.alertIds, [a.alertId]);
+});
+
+test('eviction watermark is the newest alertTime, capped at wall clock plus a window', () => {
+  const now = Date.parse(at(0));
+  const c = createCorrelator({ windowMs: WINDOW, escalateCount: 3, now: () => now });
+  const first = c.ingest(makeAlert({ minutes: 0 }));
+  // an alert dated 10 days ahead must not evict everything
+  c.ingest(makeAlert({ entityKey: '198.51.100.200', minutes: 10 * 24 * 60 }));
+  assert.deepEqual(c.stats(), { groups: 2, alerts: 2 });
+  const next = c.ingest(makeAlert({ minutes: 1 }));
+  assert.equal(next.correlationId, first.correlationId);
+  assert.equal(next.alertIds.length, 2);
+});

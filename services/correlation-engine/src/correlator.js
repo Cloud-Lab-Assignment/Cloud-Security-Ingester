@@ -12,10 +12,22 @@ import { createHash } from 'node:crypto';
 //   - an alert more than windowMs before firstSeen does NOT join: it is an
 //     older, separate burst and opens (or joins) an older group. This keeps the
 //     rule symmetric, so the grouping does not depend on arrival order.
-// Old groups of an entity are kept (no idle eviction, out of scope for the
-// demo) so a late alert can still find its group. If an alert is within reach
-// of two groups it joins the nearest one (ties go to the newer group). Groups
-// are never merged, because that would change an existing correlationId.
+// If an alert is within reach of two groups it joins the nearest one (ties go
+// to the newer group). Groups are never merged, because that would change an
+// existing correlationId.
+//
+// Eviction (memory bound): a group's window closes at lastSeen + windowMs (no
+// later alert can join it after that). A group whose window closed more than
+// 2 windows before the watermark is dropped together with its alertIds, i.e.
+// when lastSeen + 3 * windowMs < watermark. The watermark is event time: the
+// newest alertTime ingested so far, so replaying old alerts from the start of
+// the topic behaves like live traffic. A single alert's contribution is capped
+// at now() + windowMs (wall clock, injectable for tests), so one far-future
+// alertTime cannot evict every live group. The sweep runs on ingest whenever
+// the watermark advances. After eviction, a very late alert opens a new group
+// and a redelivered alertId is ingested again (with the same correlationId if
+// it opened its group); incident-management's durable dedupe and merge are the
+// safety net for both.
 //
 // correlationId = "cor-" + sha256(entityKey + "|" + firstAlertId)[0..24], where
 // firstAlertId is the alert that opened the group. It does not change when
@@ -61,13 +73,38 @@ function summarize(alert, seq) {
   };
 }
 
-export function createCorrelator({ windowMs, escalateCount }) {
+export function createCorrelator({ windowMs, escalateCount, now = Date.now }) {
   if (!(windowMs > 0)) throw new TypeError('windowMs must be > 0');
   if (!(escalateCount > 0)) throw new TypeError('escalateCount must be > 0');
 
   const groupsByEntity = new Map(); // entityKey -> Set<group>
   const groupByAlertId = new Map(); // alertId -> group
   let seq = 0;
+  let watermark = -Infinity; // newest (capped) alertTime seen
+
+  function dropGroup(group) {
+    const groups = groupsByEntity.get(group.entityKey);
+    groups.delete(group);
+    if (groups.size === 0) groupsByEntity.delete(group.entityKey);
+  }
+
+  function evictExpired() {
+    const horizon = watermark - 3 * windowMs;
+    for (const groups of [...groupsByEntity.values()]) {
+      for (const group of [...groups]) {
+        if (group.lastSeen >= horizon) continue;
+        for (const alertId of group.alerts.keys()) groupByAlertId.delete(alertId);
+        dropGroup(group);
+      }
+    }
+  }
+
+  function advanceWatermark(timeMs) {
+    const t = Math.min(timeMs, now() + windowMs);
+    if (t <= watermark) return;
+    watermark = t;
+    evictExpired();
+  }
 
   function refreshSpan(group) {
     let first = Infinity;
@@ -146,6 +183,7 @@ export function createCorrelator({ windowMs, escalateCount }) {
     if (groupByAlertId.has(alert.alertId)) return null;
     seq += 1;
     const summary = summarize(alert, seq);
+    advanceWatermark(summary.timeMs);
     let group = findGroup(alert.entityKey, summary.timeMs);
     if (!group) {
       group = {
@@ -174,10 +212,15 @@ export function createCorrelator({ windowMs, escalateCount }) {
       refreshSpan(group);
       return;
     }
-    const groups = groupsByEntity.get(group.entityKey);
-    groups.delete(group);
-    if (groups.size === 0) groupsByEntity.delete(group.entityKey);
+    dropGroup(group);
   }
 
-  return { ingest, forget };
+  // Current size of the in-memory state.
+  function stats() {
+    let groups = 0;
+    for (const set of groupsByEntity.values()) groups += set.size;
+    return { groups, alerts: groupByAlertId.size };
+  }
+
+  return { ingest, forget, stats };
 }
