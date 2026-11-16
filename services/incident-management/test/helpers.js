@@ -58,14 +58,21 @@ export function fakeEventStore({ vote = 'yes' } = {}) {
   return fake;
 }
 
-export function fakePublisher() {
-  const published = [];
-  return {
-    published,
-    async publishIncidentUpdate(type, incident) {
-      published.push({ type, incident });
+// Stand-in for a kafkajs producer: records sends, optionally failing.
+export function fakeProducer() {
+  const sent = [];
+  const producer = {
+    sent,
+    failNext: 0,
+    async send(record) {
+      if (producer.failNext > 0) {
+        producer.failNext -= 1;
+        throw new Error('kafka unavailable');
+      }
+      sent.push(record);
     },
   };
+  return producer;
 }
 
 export const silentLogger = {

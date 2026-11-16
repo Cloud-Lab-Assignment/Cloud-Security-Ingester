@@ -8,7 +8,7 @@ const ID = '3f0c9e3e-5b8a-4c5e-9a57-3a8e2b9f1c11';
 const incident = (over = {}) => ({ incidentId: ID, status: 'open', severity: 'high', version: 1, ...over });
 
 function setup(repoOver = {}) {
-  const calls = { list: [], update: [], published: [], tx: [] };
+  const calls = { list: [], update: [], tx: [] };
   const repo = {
     async listIncidents(q) {
       calls.list.push(q);
@@ -26,11 +26,6 @@ function setup(repoOver = {}) {
     },
     ...repoOver,
   };
-  const publisher = {
-    async publishIncidentUpdate(type, inc) {
-      calls.published.push({ type, inc });
-    },
-  };
   const coordinatorLog = {
     async list(q) {
       calls.tx.push(q);
@@ -38,7 +33,7 @@ function setup(repoOver = {}) {
     },
   };
   const app = buildApp({ service: 'incident-management', logger: false });
-  registerRoutes(app, { repo, publisher, coordinatorLog });
+  registerRoutes(app, { repo, coordinatorLog });
   return { app, calls };
 }
 
@@ -69,7 +64,7 @@ test('GET /incidents/:id returns 200 or 404', async (t) => {
   assert.equal((await app.inject({ method: 'GET', url: '/incidents/not-a-uuid' })).statusCode, 404);
 });
 
-test('PATCH updates status and publishes incident.status_changed', async (t) => {
+test('PATCH updates status', async (t) => {
   const { app, calls } = setup();
   t.after(() => app.close());
   const res = await app.inject({
@@ -81,7 +76,6 @@ test('PATCH updates status and publishes incident.status_changed', async (t) => 
   assert.equal(res.json().status, 'investigating');
   assert.equal(res.json().version, 2);
   assert.deepEqual(calls.update[0], { id: ID, body: { status: 'investigating', version: 1, actor: 'alice', note: 'on it' } });
-  assert.equal(calls.published[0].type, 'incident.status_changed');
 });
 
 test('PATCH with stale version returns 409', async (t) => {
@@ -94,7 +88,6 @@ test('PATCH with stale version returns 409', async (t) => {
   const res = await app.inject({ method: 'PATCH', url: `/incidents/${ID}`, payload: { status: 'resolved', version: 1 } });
   assert.equal(res.statusCode, 409);
   assert.deepEqual(res.json(), { error: 'version_conflict', currentVersion: 3 });
-  assert.equal(calls.published.length, 0);
 });
 
 test('PATCH during a pending 3PC transaction returns 409', async (t) => {

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { isoTimestamp } from '@core/common';
+import { enqueueIncidentUpdate } from './outbox.js';
 
 export const SEVERITIES = ['low', 'medium', 'high', 'critical'];
 export const STATUSES = ['open', 'investigating', 'resolved', 'false_positive'];
@@ -210,8 +211,10 @@ export function createIncidentRepo({ pool, correlationWindowMs, now = Date.now }
         at,
       ]);
       const alertIds = await alertIdsFor(client, incidentId);
+      const incident = rowToIncident(updated.rows[0], alertIds);
+      await enqueueIncidentUpdate(client, 'incident.status_changed', incident, now);
       await client.query('COMMIT');
-      return rowToIncident(updated.rows[0], alertIds);
+      return incident;
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
       throw err;

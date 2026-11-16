@@ -4,7 +4,7 @@ import { loadConfig } from './config.js';
 import { createPool } from './db.js';
 import { migrate } from './migrate.js';
 import { createIncidentRepo } from './incidents.js';
-import { createPublisher } from './publisher.js';
+import { createOutboxRelay } from './outbox.js';
 import {
   createEventStoreParticipant,
   createIncidentService,
@@ -47,7 +47,7 @@ async function main() {
     },
   });
 
-  const publisher = createPublisher({ producer, topic: config.incidentTopic });
+  const outbox = createOutboxRelay({ pool, producer, topic: config.incidentTopic, logger });
   const repo = createIncidentRepo({ pool, correlationWindowMs: config.correlationWindowMs });
   const coordinatorLog = createPgCoordinatorLog(pool);
   const eventStore = createEventStoreParticipant({ baseUrl: config.eventStoreUrl, timeoutMs: config.tpcTimeoutMs });
@@ -55,7 +55,6 @@ async function main() {
     pool,
     repo,
     eventStore,
-    publisher,
     config,
     logger,
     metrics: createTpcMetrics(app.metrics),
@@ -95,8 +94,11 @@ async function main() {
   });
   logger.info({ port: grpcPort }, 'gRPC listening');
 
-  registerRoutes(app, { repo, publisher, coordinatorLog, logger });
+  registerRoutes(app, { repo, coordinatorLog });
   await app.listen({ host: '0.0.0.0', port: config.port });
+
+  // Publish queued incident-updates (transactional outbox) every second.
+  outbox.start();
 
   // Participant-side timeouts for the local incident-db participant.
   let sweeping = false;
@@ -119,6 +121,7 @@ async function main() {
     stopping = true;
     logger.info({ signal }, 'shutting down');
     clearInterval(sweeper);
+    await outbox.stop();
     await new Promise((resolve) => grpcServer.tryShutdown(() => resolve()));
     await app.close();
     await producer.disconnect().catch(() => {});

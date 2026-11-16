@@ -9,7 +9,8 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 //   PATCH /incidents/:id {status, version, actor?, note?}  -> incident | 400 | 404 | 409
 //   GET   /tpc/transactions?limit=&correlationId=          -> {items} (coordinator log, newest first)
 // Status changes are plain local updates; only correlation decisions use 3PC.
-export function registerRoutes(app, { repo, publisher, coordinatorLog, logger }) {
+// incident-updates messages go through the transactional outbox (outbox.js).
+export function registerRoutes(app, { repo, coordinatorLog }) {
   app.setErrorHandler((err, request, reply) => {
     if (err.validation) return reply.code(400).send({ error: 'bad_request', message: err.message });
     request.log.error({ err }, 'request failed');
@@ -80,11 +81,7 @@ export function registerRoutes(app, { repo, publisher, coordinatorLog, logger })
         if (err instanceof TransactionPending) return reply.code(409).send({ error: 'transaction_pending' });
         throw err;
       }
-      try {
-        await publisher.publishIncidentUpdate('incident.status_changed', incident);
-      } catch (err) {
-        (logger ?? request.log).error({ err, incidentId: id }, 'failed to publish status change');
-      }
+      // incident.status_changed was queued in the outbox by updateStatus.
       return incident;
     },
   );

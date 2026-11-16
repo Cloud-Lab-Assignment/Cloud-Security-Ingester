@@ -10,7 +10,7 @@ import {
   IncidentAborted,
   StaleVersion,
 } from '../src/tpc-wiring.js';
-import { createTestDatabase, fakeEventStore, fakePublisher, silentLogger, candidate } from './helpers.js';
+import { createTestDatabase, fakeEventStore, silentLogger, candidate } from './helpers.js';
 
 const skip = !process.env.INTEGRATION;
 const config = {
@@ -22,20 +22,32 @@ const config = {
 let db;
 let repo;
 
+// incident-updates messages waiting in the transactional outbox for an incident.
+async function outboxTypes(incidentId) {
+  const { rows } = await db.pool.query('SELECT type FROM outbox WHERE incident_id = $1 ORDER BY id', [incidentId]);
+  return rows.map((r) => r.type);
+}
+
+async function outboxForCorrelation(correlationId) {
+  const { rows } = await db.pool.query(
+    `SELECT o.type FROM outbox o JOIN incidents i ON i.incident_id = o.incident_id WHERE i.correlation_id = $1 ORDER BY o.id`,
+    [correlationId],
+  );
+  return rows.map((r) => r.type);
+}
+
 function service(over = {}) {
   const eventStore = over.eventStore ?? fakeEventStore();
-  const publisher = over.publisher ?? fakePublisher();
   const svc = createIncidentService({
     pool: db.pool,
     repo,
     eventStore,
-    publisher,
     config: { ...config, ...(over.config ?? {}) },
     logger: silentLogger,
     onCrash: over.onCrash,
     participantHooks: over.participantHooks,
   });
-  return { svc, eventStore, publisher };
+  return { svc, eventStore };
 }
 
 before(async () => {
@@ -52,11 +64,11 @@ after(async () => {
 test('migrate is idempotent', { skip }, async () => {
   assert.deepEqual(await migrate(db.pool), []);
   const { rows } = await db.pool.query('SELECT name FROM schema_migrations');
-  assert.deepEqual(rows.map((r) => r.name), ['001_init.sql']);
+  assert.deepEqual(rows.map((r) => r.name).sort(), ['001_init.sql', '002_outbox.sql']);
 });
 
-test('upsertIncident commits to postgres and event-store and publishes incident.created', { skip }, async () => {
-  const { svc, eventStore, publisher } = service();
+test('upsertIncident commits to postgres and event-store and queues incident.created', { skip }, async () => {
+  const { svc, eventStore } = service();
   const c = candidate();
   const res = await svc.upsertIncident(c);
   assert.equal(res.outcome, 'created');
@@ -73,9 +85,13 @@ test('upsertIncident commits to postgres and event-store and publishes incident.
   assert.equal(eventStore.applied[0].version, 1);
   assert.equal(eventStore.applied[0].decision.kind, 'create');
 
-  assert.equal(publisher.published.length, 1);
-  assert.equal(publisher.published[0].type, 'incident.created');
-  assert.equal(publisher.published[0].incident.incidentId, res.incident.incidentId);
+  assert.deepEqual(await outboxTypes(res.incident.incidentId), ['incident.created']);
+  const { rows: [msg] } = await db.pool.query('SELECT payload FROM outbox WHERE incident_id = $1', [res.incident.incidentId]);
+  assert.equal(msg.payload.schemaVersion, '1.0');
+  assert.equal(msg.payload.type, 'incident.created');
+  assert.equal(msg.payload.incident.version, 1);
+  assert.deepEqual(msg.payload.incident.alertIds, c.alertIds);
+  assert.deepEqual(msg.payload.producedBy, { name: 'incident-management', version: '1.0.0' });
 
   const [tx] = await createPgCoordinatorLog(db.pool).list({ correlationId: c.correlationId });
   assert.equal(tx.state, 'COMMITTED');
@@ -85,8 +101,8 @@ test('upsertIncident commits to postgres and event-store and publishes incident.
   assert.equal(history[0].txId, tx.txId);
 });
 
-test('second candidate with a new alert updates and publishes incident.updated', { skip }, async () => {
-  const { svc, eventStore, publisher } = service();
+test('second candidate with a new alert updates and queues incident.updated', { skip }, async () => {
+  const { svc, eventStore } = service();
   const c1 = candidate();
   const first = await svc.upsertIncident(c1);
   const newAlert = `${c1.alertIds[0]}-2`;
@@ -98,7 +114,7 @@ test('second candidate with a new alert updates and publishes incident.updated',
   assert.equal(res.incident.incidentId, first.incident.incidentId);
   assert.deepEqual(eventStore.applied.map((p) => p.version), [1, 2]);
   assert.deepEqual(eventStore.applied[1].decision.newAlertIds, [newAlert]);
-  assert.deepEqual(publisher.published.map((p) => p.type), ['incident.created', 'incident.updated']);
+  assert.deepEqual(await outboxTypes(res.incident.incidentId), ['incident.created', 'incident.updated']);
 });
 
 test('redelivered candidate with only known alerts is a noop without 3PC', { skip }, async () => {
@@ -112,13 +128,13 @@ test('redelivered candidate with only known alerts is a noop without 3PC', { ski
 });
 
 test('event-store votes no → no row, IncidentAborted("vote_no")', { skip }, async () => {
-  const { svc, eventStore, publisher } = service({ eventStore: fakeEventStore({ vote: 'no' }) });
+  const { svc, eventStore } = service({ eventStore: fakeEventStore({ vote: 'no' }) });
   const c = candidate();
   await assert.rejects(svc.upsertIncident(c), (err) => err instanceof IncidentAborted && err.reason === 'vote_no');
   const { rowCount } = await db.pool.query('SELECT 1 FROM incidents WHERE correlation_id = $1', [c.correlationId]);
   assert.equal(rowCount, 0);
   assert.equal(eventStore.applied.length, 0);
-  assert.equal(publisher.published.length, 0);
+  assert.deepEqual(await outboxForCorrelation(c.correlationId), []);
   const [tx] = await createPgCoordinatorLog(db.pool).list({ correlationId: c.correlationId });
   assert.equal(tx.state, 'ABORTED');
   assert.equal(tx.reason, 'vote_no');
@@ -126,7 +142,7 @@ test('event-store votes no → no row, IncidentAborted("vote_no")', { skip }, as
   assert.equal(local.rows[0].state, 'ABORTED');
 });
 
-test('TPC_FAULT crash then recover() commits and publishes', { skip }, async () => {
+test('TPC_FAULT crash then recover() commits and queues the update', { skip }, async () => {
   const eventStore = fakeEventStore();
   let crashed = null;
   const { svc } = service({
@@ -143,14 +159,14 @@ test('TPC_FAULT crash then recover() commits and publishes', { skip }, async () 
   assert.equal(rowCount, 0, 'nothing applied before doCommit');
 
   // "Restart": a new coordinator without the fault over the same database.
-  const publisher = fakePublisher();
-  const { svc: restarted } = service({ eventStore, publisher });
+  assert.deepEqual(await outboxForCorrelation(c.correlationId), [], 'nothing queued before the commit');
+  const { svc: restarted } = service({ eventStore });
   const recovered = await restarted.recover();
   assert.equal(recovered.length, 1);
   ({ rowCount } = await db.pool.query('SELECT 1 FROM incidents WHERE correlation_id = $1', [c.correlationId]));
   assert.equal(rowCount, 1);
   assert.equal(eventStore.applied.length, 1);
-  assert.deepEqual(publisher.published.map((p) => p.type), ['incident.created']);
+  assert.deepEqual(await outboxForCorrelation(c.correlationId), ['incident.created']);
   const [tx] = await createPgCoordinatorLog(db.pool).list({ correlationId: c.correlationId });
   assert.equal(tx.state, 'COMMITTED');
 });
@@ -236,6 +252,14 @@ test('updateStatus bumps version and records history', { skip }, async () => {
   const history = await repo.getHistory(incident.incidentId);
   assert.deepEqual(history.at(-1).change, { kind: 'status', from: 'open', to: 'investigating', note: 'looking' });
   assert.equal(history.at(-1).actor, 'alice');
+  // The status change is queued for incident-updates in the same transaction (P1-3).
+  assert.deepEqual(await outboxTypes(incident.incidentId), ['incident.created', 'incident.status_changed']);
+  const { rows } = await db.pool.query(
+    `SELECT payload FROM outbox WHERE incident_id = $1 AND type = 'incident.status_changed'`,
+    [incident.incidentId],
+  );
+  assert.equal(rows[0].payload.incident.status, 'investigating');
+  assert.equal(rows[0].payload.incident.version, 2);
 });
 
 test('updateStatus stale version throws VersionConflict', { skip }, async () => {
@@ -243,6 +267,7 @@ test('updateStatus stale version throws VersionConflict', { skip }, async () => 
   const { incident } = await svc.upsertIncident(candidate());
   await repo.updateStatus(incident.incidentId, { status: 'investigating', version: 1 });
   await assert.rejects(repo.updateStatus(incident.incidentId, { status: 'resolved', version: 1 }), VersionConflict);
+  assert.deepEqual(await outboxTypes(incident.incidentId), ['incident.created', 'incident.status_changed'], 'a refused PATCH queues nothing');
 });
 
 test('updateStatus refuses while a 3PC transaction is pending', { skip }, async () => {

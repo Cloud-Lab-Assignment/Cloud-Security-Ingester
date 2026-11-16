@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import client from 'prom-client';
 import { createCoordinator, createParticipant, CoordinatorCrash, TpcStateError } from '@core/tpc';
 import { withTransaction } from './db.js';
-import { mergeCandidate } from './incidents.js';
+import { mergeCandidate, rowToIncident } from './incidents.js';
+import { enqueueIncidentUpdate } from './outbox.js';
 
 export const INCIDENT_DB = 'incident-db';
 export const EVENT_STORE = 'event-store';
@@ -182,6 +183,12 @@ export async function applyDecision(pool, { txId, kind, version, incident, newAl
       'correlation-engine',
       new Date(now()),
     ]);
+    // Queue incident-updates in the same transaction (P1-3): if this commits,
+    // the message is published eventually, whoever drove the commit.
+    const { rows } = await db.query('SELECT * FROM incidents WHERE incident_id = $1', [i.incidentId]);
+    const alerts = await db.query('SELECT alert_id FROM incident_alerts WHERE incident_id = $1 ORDER BY alert_id', [i.incidentId]);
+    const snapshot = rowToIncident(rows[0], alerts.rows.map((r) => r.alert_id));
+    await enqueueIncidentUpdate(db, kind === 'create' ? 'incident.created' : 'incident.updated', snapshot, now);
   });
 }
 
@@ -267,7 +274,6 @@ export function createIncidentService({
   pool,
   repo,
   eventStore,
-  publisher,
   config,
   logger,
   metrics = createTpcMetrics(),
@@ -277,19 +283,10 @@ export function createIncidentService({
 }) {
   const local = createIncidentDbParticipant({ pool, timeoutMs: config.tpcParticipantTimeoutMs, now, hooks: participantHooks });
 
-  async function onCommitted(txId, payloads) {
+  // incident-updates is queued by applyDecision in the outbox, so a commit
+  // only needs counting here.
+  async function onCommitted() {
     metrics.transactions.inc({ outcome: 'committed' });
-    const decision = payloads[INCIDENT_DB];
-    try {
-      const incident = await repo.getIncident(decision.incident.incidentId);
-      if (!incident) return;
-      const type = decision.kind === 'create' ? 'incident.created' : 'incident.updated';
-      await publisher.publishIncidentUpdate(type, incident);
-    } catch (err) {
-      // The decision is already committed everywhere; a lost notification must
-      // not turn it into an error for the caller.
-      logger?.error({ err, txId }, 'failed to publish incident update');
-    }
   }
 
   const coordinator = createCoordinator({
