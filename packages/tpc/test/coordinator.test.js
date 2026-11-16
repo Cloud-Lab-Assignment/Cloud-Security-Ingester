@@ -345,3 +345,68 @@ test('TpcStateError carries the participant state', () => {
   assert.equal(e.name, 'TpcStateError');
   assert.ok(e instanceof Error);
 });
+
+test('recover() skips a transaction that run() is still driving', async () => {
+  const trace = [];
+  const a = makeParticipant('a', trace);
+  const b = makeParticipant('b', trace, {
+    hooks: {
+      canCommit: async () => {
+        await sleep(20); // slow vote, still inside the coordinator timeout
+      },
+    },
+  });
+  const { c, log, committed } = coordinator([a, b]);
+  const running = c.run('tx1', payloads);
+  await sleep(5);
+  assert.equal(log.map.get('tx1').state, 'WAITING');
+  assert.deepEqual(c.inFlight(), ['tx1']);
+  assert.deepEqual(await c.recover(), []);
+  assert.equal(log.map.get('tx1').state, 'WAITING');
+  assert.ok(!trace.some((t) => t.endsWith(':abort') || t.endsWith(':preCommit')));
+  assert.deepEqual(await running, { outcome: 'committed' });
+  assert.deepEqual(log.history, ['tx1:WAITING', 'tx1:PRECOMMITTED', 'tx1:COMMITTED']);
+  assert.equal(committed.length, 1);
+  assert.equal(await a.state('tx1'), 'COMMITTED');
+  assert.equal(await b.state('tx1'), 'COMMITTED');
+  assert.deepEqual(c.inFlight(), []);
+});
+
+test('a run() that threw is no longer in flight, so recover() finishes it', async () => {
+  const trace = [];
+  const a = makeParticipant('a', trace);
+  const { c, log } = coordinator([a], { fault: 'crash-after-precommit' });
+  await assert.rejects(c.run('tx1', { a: {} }), CoordinatorCrash);
+  assert.deepEqual(await c.recover(), ['tx1']);
+  assert.equal(log.map.get('tx1').state, 'COMMITTED');
+});
+
+test('concurrent recover() calls do not overlap: the second joins the first', async () => {
+  const trace = [];
+  const a = makeParticipant('a', trace, {
+    hooks: {
+      preCommit: async () => {
+        await sleep(5);
+      },
+    },
+  });
+  const { log } = coordinator([a]);
+  await a.sm.canCommit('tx1', {});
+  await log.put({ txId: 'tx1', state: 'PRECOMMITTED', payloads: { a: {} }, updatedAt: Date.now() });
+  const committed = [];
+  const r = createCoordinator({
+    log,
+    participants: [a.adapter],
+    timeoutMs: 40,
+    retryDelayMs: 1,
+    onCommitted: async (txId) => committed.push(txId),
+  });
+  const [first, second] = await Promise.all([r.recover(), r.recover()]);
+  assert.deepEqual(first, ['tx1']);
+  assert.deepEqual(second, ['tx1']);
+  assert.equal(trace.filter((t) => t === 'a:preCommit').length, 1);
+  assert.equal(trace.filter((t) => t === 'a:doCommit').length, 1);
+  assert.deepEqual(committed, ['tx1']);
+  // Once finished, a new call runs again.
+  assert.deepEqual(await r.recover(), []);
+});

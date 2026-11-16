@@ -81,7 +81,20 @@ export function createCoordinator({
     return { outcome: 'committed' };
   }
 
+  // txIds a run() in this process is driving right now; recover() leaves
+  // them alone so a periodic recovery cannot abort a live transaction.
+  const inFlight = new Set();
+
   async function run(txId, payloads) {
+    inFlight.add(txId);
+    try {
+      return await drive(txId, payloads);
+    } finally {
+      inFlight.delete(txId);
+    }
+  }
+
+  async function drive(txId, payloads) {
     await write(txId, WAITING, payloads);
 
     // Phase 1: canCommit, each vote raced against the timeout.
@@ -125,12 +138,27 @@ export function createCoordinator({
     return commitAll(txId, payloads);
   }
 
-  // Finish every transaction the log left unfinished (after a crash/restart).
-  async function recover() {
+  // Finish every transaction the log left unfinished (after a crash/restart,
+  // or a commit whose doCommit was never acked), except those run() is still
+  // driving. Safe to call periodically: a call made while another recovery is
+  // running does not start a second pass, it joins the running one and
+  // resolves with the same list of finished txIds.
+  let recovering = null;
+  function recover() {
+    if (!recovering) {
+      recovering = recoverOnce().finally(() => {
+        recovering = null;
+      });
+    }
+    return recovering;
+  }
+
+  async function recoverOnce() {
     const finished = [];
     const entries = await log.listUnfinished();
     for (const entry of entries) {
       const { txId, payloads } = entry;
+      if (inFlight.has(txId)) continue;
       if (entry.state === WAITING) {
         await abortAll(txId, payloads, 'recovered_waiting');
         finished.push(txId);
@@ -169,5 +197,5 @@ export function createCoordinator({
     return finished;
   }
 
-  return { run, recover };
+  return { run, recover, inFlight: () => [...inFlight] };
 }
