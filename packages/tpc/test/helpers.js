@@ -1,4 +1,9 @@
+import { StoreConflict } from '../src/index.js';
+
 // In-memory stores and a fake clock for the 3PC tests.
+// put(record, expected) honours the conditional-write contract: when
+// `expected` is given, the current state must equal expected.state (null =
+// the record must not exist), otherwise StoreConflict is thrown.
 export function memoryStore() {
   const map = new Map();
   return {
@@ -7,7 +12,11 @@ export function memoryStore() {
       const r = map.get(txId);
       return r ? structuredClone(r) : null;
     },
-    async put(record) {
+    async put(record, expected) {
+      if (expected !== undefined) {
+        const current = map.get(record.txId)?.state ?? null;
+        if (current !== expected.state) throw new StoreConflict(record.txId, expected.state, current);
+      }
       map.set(record.txId, structuredClone(record));
     },
     async listPending() {

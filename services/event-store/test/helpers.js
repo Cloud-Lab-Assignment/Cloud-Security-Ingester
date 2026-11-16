@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { StoreConflict } from '@core/tpc';
 
 // Shared fixtures and fakes for the event-store tests.
 
@@ -91,7 +92,12 @@ export function fakeRepo() {
         const r = tpc.get(txId);
         return r ? structuredClone(r) : null;
       },
-      async put(rec) {
+      // Same conditional-write contract as the DynamoDB tpcStore.
+      async put(rec, expected) {
+        if (expected !== undefined) {
+          const current = tpc.get(rec.txId)?.state ?? null;
+          if (current !== expected.state) throw new StoreConflict(rec.txId, expected.state, current);
+        }
         tpc.set(rec.txId, structuredClone(rec));
       },
       async listPending() {

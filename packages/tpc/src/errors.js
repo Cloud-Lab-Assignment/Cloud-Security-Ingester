@@ -20,3 +20,17 @@ export class CoordinatorCrash extends Error {
     this.txId = txId;
   }
 }
+
+// A conditional store write found a different state than the caller read.
+// Stores throw it from put(record, expected) when expected.state (null = "the
+// record must not exist") does not match; the participant re-reads and
+// re-evaluates. `actual` is the state found, when the store knows it.
+export class StoreConflict extends Error {
+  constructor(txId, expected, actual) {
+    super(`tx ${txId}: store conflict, expected state ${expected ?? 'NONE'}${actual === undefined ? '' : `, found ${actual ?? 'NONE'}`}`);
+    this.name = 'StoreConflict';
+    this.txId = txId;
+    this.expected = expected ?? null;
+    if (actual !== undefined) this.actual = actual;
+  }
+}

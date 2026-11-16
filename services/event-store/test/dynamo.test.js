@@ -10,6 +10,7 @@ import {
   tableNames,
 } from '../src/dynamo.js';
 import { ensureLocalResources } from '../src/local-setup.js';
+import { StoreConflict, TpcStateError } from '@core/tpc';
 import { createCorrelationParticipant } from '../src/participant.js';
 import { normalizedEvent, correlationPayload, integrationEnv, silentLogger } from './helpers.js';
 
@@ -158,6 +159,67 @@ describe('dynamodb repo (integration)', { skip: !process.env.INTEGRATION }, () =
     // Resolve them so the sweep test below does not pick up these dummy payloads.
     await repo.tpcStore.put({ txId: ids[0], state: 'ABORTED', payload: { a: 1 }, updatedAt: 5 });
     await repo.tpcStore.put({ txId: ids[1], state: 'ABORTED', payload: { a: 2 }, updatedAt: 6 });
+  });
+
+  test('tpcStore.put is conditional on the expected state (StoreConflict on mismatch)', async () => {
+    const txId = randomUUID();
+    const rec = (state, updatedAt) => ({ txId, state, payload: { a: 1 }, updatedAt });
+    await repo.tpcStore.put(rec('UNCERTAIN', 1), { state: null });
+    await assert.rejects(repo.tpcStore.put(rec('ABORTED', 2), { state: null }), (e) => {
+      assert.ok(e instanceof StoreConflict);
+      assert.equal(e.name, 'StoreConflict');
+      return true;
+    });
+    await assert.rejects(repo.tpcStore.put(rec('COMMITTED', 2), { state: 'PRECOMMITTED' }), StoreConflict);
+    // A missing record does not match an expected state.
+    await assert.rejects(
+      repo.tpcStore.put({ txId: randomUUID(), state: 'PRECOMMITTED', payload: null, updatedAt: 1 }, { state: 'UNCERTAIN' }),
+      StoreConflict,
+    );
+    assert.equal((await repo.tpcStore.get(txId)).state, 'UNCERTAIN');
+    await repo.tpcStore.put(rec('PRECOMMITTED', 3), { state: 'UNCERTAIN' });
+    assert.equal((await repo.tpcStore.get(txId)).state, 'PRECOMMITTED');
+    // Without `expected` the write stays unconditional.
+    await repo.tpcStore.put(rec('ABORTED', 4));
+    assert.equal((await repo.tpcStore.get(txId)).state, 'ABORTED');
+  });
+
+  test('two replicas on one table: a stale sweep-abort cannot overwrite PRECOMMITTED', async () => {
+    let t = 2_000_000;
+    const now = () => t;
+    const make = (store) =>
+      createCorrelationParticipant({ store, putCorrelation: repo.putCorrelation, timeoutMs: 1000, now });
+    const b = make(repo.tpcStore);
+    // Replica a's view of the table runs replica b's preCommit between a's read and a's write.
+    let hook = null;
+    const racy = {
+      ...repo.tpcStore,
+      async put(record, expected) {
+        const h = hook;
+        hook = null;
+        if (h) await h();
+        return repo.tpcStore.put(record, expected);
+      },
+    };
+    const a = make(racy);
+    const txId = randomUUID();
+    assert.equal(await b.canCommit(txId, correlationPayload({ correlationId: `cor-${randomUUID()}` })), 'yes');
+    t += 5000;
+    hook = () => b.preCommit(txId);
+    const res = await a.sweep();
+    assert.ok(!res.aborted.includes(txId));
+    assert.equal((await repo.tpcStore.get(txId)).state, 'PRECOMMITTED');
+    // And the other way round: preCommit losing to a sweep-abort is rejected.
+    const tx2 = randomUUID();
+    assert.equal(await a.canCommit(tx2, correlationPayload({ correlationId: `cor-${randomUUID()}` })), 'yes');
+    t += 5000;
+    hook = async () => {
+      await b.sweep();
+    };
+    await assert.rejects(a.preCommit(tx2), (e) => e instanceof TpcStateError && e.state === 'ABORTED');
+    assert.equal((await repo.tpcStore.get(tx2)).state, 'ABORTED');
+    // Resolve the first one so later sweeps in this suite do not commit it.
+    await b.doCommit(txId);
   });
 
   test('3pc participant commits through dynamodb; sweep resolves timed-out records', async () => {

@@ -1,5 +1,6 @@
 import { DynamoDBClient, DescribeTableCommand } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
+import { StoreConflict } from '@core/tpc';
 
 export const EVENT_ID_INDEX = 'eventId-index';
 
@@ -167,13 +168,32 @@ export function createDynamoRepo({ doc, tablePrefix }) {
   }
 
   // Participant state for @core/tpc: records are {txId, state, payload, updatedAt}.
+  // put(record, expected) is a conditional write when `expected` is given:
+  // {state: null} = the record must not exist, {state: S} = its state must be S.
+  // A failed condition (another replica wrote first) becomes StoreConflict.
   const tpcStore = {
     async get(txId) {
       const out = await doc.send(new GetCommand({ TableName: tables.tpc, Key: { txId }, ConsistentRead: true }));
       return out.Item ?? null;
     },
-    async put(record) {
-      await doc.send(new PutCommand({ TableName: tables.tpc, Item: record }));
+    async put(record, expected) {
+      const condition =
+        expected === undefined
+          ? {}
+          : expected.state === null
+            ? { ConditionExpression: 'attribute_not_exists(txId)' }
+            : {
+                // `state` is a reserved word. A missing item fails this check too.
+                ConditionExpression: '#s = :expected',
+                ExpressionAttributeNames: { '#s': 'state' },
+                ExpressionAttributeValues: { ':expected': expected.state },
+              };
+      try {
+        await doc.send(new PutCommand({ TableName: tables.tpc, Item: record, ...condition }));
+      } catch (err) {
+        if (isConditionFailure(err)) throw new StoreConflict(record.txId, expected.state);
+        throw err;
+      }
     },
     async listPending() {
       const items = [];
