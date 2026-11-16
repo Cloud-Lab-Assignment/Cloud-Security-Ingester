@@ -34,7 +34,8 @@ docker build -f services/event-store/Dockerfile -t event-store:<tag> .
 **REST API** (called in-cluster by correlation-engine and incident-management):
 - `GET /events/:eventId`, `GET /events?entityKey=&from=&to=&limit=&cursor=`, `GET /correlations/:correlationId`
 - 3PC participant: `POST /tpc/:txId/can-commit | pre-commit | do-commit | abort`. A state conflict returns **409 `{error:"bad_state", state}`**.
-- A malformed `cursor` (or one from a different `entityKey`) returns 400. An `entityKey` longer than 1024 UTF-8 bytes is stored under `h:` + its sha256 and looked up the same way, so callers just pass the original key.
+- A `cursor` must come from the same query: a non-empty `entityKey` (≤ 2048 UTF-8 bytes) equal to the query's, and a non-empty `sk` (≤ 1024 bytes) inside the query's `from`/`to` range. Anything else returns 400.
+- An `entityKey` longer than 1024 UTF-8 bytes, or one that starts with `h:`, is stored under `h:` + its sha256 and looked up the same way, so callers just pass the original key. `h:` is reserved for these hashed keys.
 
 **Env vars:**
 
@@ -56,7 +57,7 @@ docker build -f services/event-store/Dockerfile -t event-store:<tag> .
 | `S3_ENDPOINT` | unset | **leave unset** | Local only (S3 mock). When set, path-style addressing is used. |
 | `TPC_TIMEOUT_MS` | `10000` | no | Participant timeout. On expiry it first asks the coordinator for its decision; only if the coordinator is unreachable does UNCERTAIN self-abort / PRECOMMITTED self-commit. |
 | `COORDINATOR_URL` | `http://localhost:8082` | **yes** | `http://incident-management:8082`. Used for the 3PC decision lookup (`GET /tpc/transactions/:txId`). Empty string disables the lookup (pure timeout rule). |
-| `COORDINATOR_TIMEOUT_MS` | `2000` | no | Timeout of that lookup. |
+| `COORDINATOR_TIMEOUT_MS` | `2000` | no | Timeout of that lookup. A timeout counts as "coordinator unreachable" (see Known limits in the design doc). |
 | `AWS_REQUEST_TIMEOUT_MS` | `5000` | no | Per-request deadline for DynamoDB and S3, so a stuck call fails well inside the Kafka session timeout. |
 | `AWS_MAX_ATTEMPTS` | `3` | no | AWS SDK attempts per call. |
 | `TPC_FORCE_VOTE` | unset | **leave unset** | Demo only (`no` forces a "no" vote). |
@@ -82,7 +83,7 @@ The image bakes in the AWS RDS CA bundle at `/etc/ssl/rds/global-bundle.pem`.
 
 **Ports:** `8082` (REST API, `/health`, `/ready`, `/metrics`), `50051` (gRPC `incident.v1.IncidentService`, called by correlation-engine; plaintext h2c inside the cluster).
 
-**Kafka:** produces `incident-updates` (key `incidentId`) through a transactional outbox: every message is written in the same Postgres transaction as the change and published in order by a relay. Delivery is at-least-once, so consumers should dedupe on `incidentId` + `version` + `type`. Consumes nothing.
+**Kafka:** produces `incident-updates` (key `incidentId`) through a transactional outbox: every message is written in the same Postgres transaction as the change and published in order by a relay. A 3PC change is published only once the coordinator has logged it COMMITTED, and later messages of that incident wait behind it. Delivery is at-least-once, so consumers should dedupe on `incidentId` + `version` + `type`. Consumes nothing.
 
 **REST API:**
 - `GET /incidents?status=&severity=&entityKey=&limit=`, `GET /incidents/:id`, `GET /incidents/:id/history`
@@ -136,7 +137,11 @@ docker build -f services/correlation-engine/Dockerfile -t correlation-engine:<ta
 
 **Ports:** `8083` (`/health`, `/ready`, `/metrics` only; no business API).
 
-**Kafka:** consumes `security-alerts` (consumer group `correlation-engine-cg`). Produces nothing. A malformed alert (missing or wrong-typed `alertId`, `entityKey`, `alertTime`, `window`, `eventCount`, `relatedEventIds`, …) is logged at warn with topic/partition/offset, counted in `alerts_consumed_total{result="invalid"}` and skipped; it never stops the consumer.
+**Kafka:** consumes `security-alerts` (consumer group `correlation-engine-cg`). Produces nothing. Alert validation:
+- **Required:** `alertId` and `entityKey` (non-empty strings) and `alertTime` (UTC ISO timestamp).
+- **Optional, checked only when present** (absent or `null` is fine): `severity` and `ruleId` (strings; an unknown severity counts as `medium`), `eventCount` (non-negative integer), `relatedEventIds` (array of strings), `entity` (object) and `window` (object whose `start` and `end` are ISO timestamps).
+
+A malformed alert is logged at warn with topic/partition/offset, counted in `alerts_consumed_total{result="invalid"}` and skipped; it never stops the consumer.
 
 **Readiness:** `/ready` is 200 while the consumer is in its consumer group (kafkajs `GROUP_JOIN`) and 503 after a crash, stop or disconnect until it rejoins.
 
@@ -271,7 +276,8 @@ Every service exposes Prometheus metrics on `/metrics` (request rate, errors and
 ```sh
 docker pull node:22-alpine && docker image inspect node:22-alpine --format '{{index .RepoDigests 0}}'
 docker pull postgres:16-alpine && docker image inspect postgres:16-alpine --format '{{index .RepoDigests 0}}'
-curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem | sha256sum
+curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem | sha256sum        # Linux
+curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem | shasum -a 256   # macOS
 ```
 
 Put the new digests in the `FROM` lines / `docker-compose.yml` and the new sha256 in `services/incident-management/Dockerfile`, then re-run the group-repo export.

@@ -106,6 +106,7 @@ stateDiagram-v2
     [*] --> ABORTED: canCommit, votes no
     UNCERTAIN --> PRECOMMITTED: preCommit
     UNCERTAIN --> ABORTED: abort, or timeout
+    UNCERTAIN --> COMMITTED: timeout, coordinator reports COMMITTED
     PRECOMMITTED --> COMMITTED: doCommit, or timeout
     PRECOMMITTED --> ABORTED: abort
   }
@@ -120,16 +121,19 @@ Coordinator log (Postgres `tpc_coordinator`): `WAITING` → `PRECOMMITTED` → `
    - `incident-db` checks that no other transaction is in flight for the same `correlationId`, and that the incident is absent (create) or still at `version - 1` (update).
    A "no" vote, an error or a timeout makes the coordinator log `ABORTED` and send `abort` to everyone.
 2. **preCommit:** the coordinator logs `PRECOMMITTED` and sends `preCommit`. Any failure or timeout aborts everyone.
-3. **doCommit:** once every participant has acknowledged `preCommit`, the decision is final. The coordinator sends `doCommit` (retried up to 5 times with backoff) and logs `COMMITTED` only when every participant acknowledged; otherwise the log stays `PRECOMMITTED` and recovery finishes it. Each participant applies its write exactly once. Both applies are idempotent per transaction ID: a DynamoDB conditional put, and a history row keyed by `tx_id` in Postgres.
+3. **doCommit:** once every participant has acknowledged `preCommit`, the decision is final. The coordinator sends `doCommit` (retried up to 5 times with backoff) and logs `COMMITTED` only when every participant acknowledged; otherwise the log stays `PRECOMMITTED` and recovery finishes it. Each participant's commit is **atomic with its state change**: the business write and the transition to `COMMITTED` happen together (one DynamoDB `TransactWriteItems`, one Postgres transaction), so there is never a business write without `COMMITTED` or the reverse. The **effects are idempotent** rather than "applied exactly once": after a crash the commit can run again, and the second run changes nothing (a DynamoDB conditional put, and a history row keyed by `tx_id` in Postgres).
 
 Participant state changes are **conditional writes** in both stores (DynamoDB condition expression, Postgres `UPDATE … WHERE state = expected`). Several Event Store replicas can therefore serve the same transaction: if one replica's timeout sweep and another's `preCommit` race, exactly one write wins and the loser re-reads and re-evaluates.
+
+The coordinator serialises `run()` and recovery **per transaction** and, inside that lock, recovery re-reads the transaction's current log state, so it never acts on a stale snapshot: it skips finished transactions and never writes `ABORTED` over one that has reached `PRECOMMITTED`.
 
 ### Timeouts and recovery
 
 - **Participant timeouts** (Event Store 10 s, `incident-db` 10 s, checked every 2 s). Before acting on a timeout, a participant first **asks the coordinator for its decision** (`GET /tpc/transactions/:txId` on Incident Management; the in-process `incident-db` participant reads the coordinator log directly):
-  - `COMMITTED` or `ABORTED`: it follows that decision.
-  - `WAITING` or `PRECOMMITTED`: the coordinator is alive and still driving or recovering the transaction, so it waits.
-  - Coordinator unreachable or the transaction unknown: the classic 3PC timeout rule. An `UNCERTAIN` participant aborts on its own; a `PRECOMMITTED` participant commits on its own. This is safe under crash failures because the coordinator only sends `preCommit` after everyone voted yes.
+  - `COMMITTED` or `ABORTED`: it follows that decision (an `UNCERTAIN` participant told `COMMITTED` commits).
+  - `WAITING` or `PRECOMMITTED`, or an answer it can't interpret (5xx, malformed body, unknown state): the coordinator is alive, so it waits and asks again on the next sweep.
+  - **Unknown transaction** (404): the coordinator logs `WAITING` before any `canCommit`, so it never started this transaction. An `UNCERTAIN` participant aborts; a `PRECOMMITTED` one is kept and logged at error level (impossible with an intact log; an operator has to resolve it).
+  - **Coordinator unreachable** (connection refused, DNS failure, lookup timeout): the classic 3PC timeout rule. An `UNCERTAIN` participant aborts on its own; a `PRECOMMITTED` participant commits on its own. This is safe under crash failures because the coordinator only sends `preCommit` after everyone voted yes.
 - **Coordinator recovery** (`recover()` at start-up before the service reports ready, then **every 15 s**; it never touches a transaction `run()` is still driving):
   - A `WAITING` transaction is aborted everywhere.
   - A `PRECOMMITTED` transaction is replayed: `preCommit` is re-sent to all participants.
@@ -154,16 +158,17 @@ The textbook remedy is a **termination protocol**, in which participants that ti
 
 In 2PC, a participant that voted yes and then loses the coordinator is **blocked**. It cannot commit (another participant might have voted no) and cannot abort (the coordinator might have committed), so it holds its state until the coordinator returns.
 
-3PC adds the `PRECOMMITTED` state. A participant only reaches it after **everyone** voted yes, so a `PRECOMMITTED` participant knows the outcome can only be commit and can finish on its own after a timeout. An `UNCERTAIN` participant knows nobody can have committed yet, so it can abort on its own. A coordinator crash therefore never blocks the participants. The demo's crash scenario shows this: the Event Store finishes its side even before Incident Management restarts.
+3PC adds the `PRECOMMITTED` state. A participant only reaches it after **everyone** voted yes, so a `PRECOMMITTED` participant knows the outcome can only be commit and can finish on its own after a timeout. An `UNCERTAIN` participant knows nobody can have committed yet, so it can abort on its own. A coordinator **crash** therefore never blocks the participants: when it is unreachable they decide on their own. (A coordinator that is up but keeps answering `PENDING` does hold them; that is deliberate, because it will finish the transaction itself.) The demo's crash scenario shows this: the Event Store finishes its side even before Incident Management restarts.
 
 ### Known limits
 
 - **Partitions and double failures:** see "When the atomicity guarantee holds" above.
+- **Slow but alive coordinator:** a decision lookup that times out (2 s) is treated as "unreachable", so a coordinator that is alive but slow can still lead a `PRECOMMITTED` participant to commit on its own while the coordinator decides to abort (or an `UNCERTAIN` one to abort while it commits). This is the remaining 3PC limit here; removing it needs a termination protocol or a consensus-based commit.
 - **Single coordinator:** Incident Management runs as exactly one replica (K8s `Recreate` strategy). Two coordinators would run recovery on the same transactions. A restart is safe, because recovery finishes in-flight transactions. The Event Store, by contrast, can run several replicas (conditional writes).
 - **Status changes are not 3PC:** an analyst `PATCH` is a local update with optimistic locking. It is serialised with the 3PC vote by the per-incident advisory lock and refused (409 `transaction_pending`) while a correlation transaction for that incident is in flight, so it can never invalidate a decided commit.
 - **In-memory correlation windows:** windows live in the Correlation Engine replica that owns the partition, and groups are evicted 2 windows after they close. After a rebalance or eviction, the new owner starts new groups. Incident Management merges them into the open incident for the same entity when the windows overlap, and an alert can belong to only one incident (unique `alert_id`), so a redelivered alert never creates a duplicate incident.
 - **Escalation after a rebalance (P2-2, not implemented):** the engine sends aggregated `severity` and `eventCount` per group. When a rebalanced engine's new group merges into an existing incident, Incident Management takes the maximum severity and event count, but it cannot re-derive "≥ 3 alerts or ≥ 2 rules → critical" from the merged set, because per-alert severity and event counts aren't sent or stored. Fixing it needs a per-alert summary in the gRPC request and in `incident_alerts`.
-- **Delivery semantics:** `incident-updates` is at-least-once (outbox relay); consumers dedupe on `incidentId` + `version` + `type`.
+- **Delivery semantics:** `incident-updates` is at-least-once (outbox relay); consumers dedupe on `incidentId` + `version` + `type`. Relay batches are serialised by an advisory lock, and a 3PC message (with every later message of the same incident) is held back until the coordinator logs the transaction `COMMITTED`, so consumers never see a change the Event Store hasn't committed and always see an incident's versions in order.
 
 ## Deployment (AWS, requirement c/d context)
 
