@@ -33,6 +33,7 @@ function service(over = {}) {
     config: { ...config, ...(over.config ?? {}) },
     logger: silentLogger,
     onCrash: over.onCrash,
+    participantHooks: over.participantHooks,
   });
   return { svc, eventStore, publisher };
 }
@@ -271,4 +272,53 @@ test('listIncidents filters by status and severity', { skip }, async () => {
   assert.ok(fp.every((i) => i.status === 'false_positive'));
   const low = await repo.listIncidents({ severity: 'low', limit: 500 });
   assert.ok(low.every((i) => i.severity === 'low'));
+});
+
+test('PATCH racing a 3PC update never leaves a decided commit unapplied (P0-2)', { skip }, async () => {
+  const { svc: base } = service();
+  const c = candidate();
+  const { incident } = await base.upsertIncident(c);
+
+  // Start an analyst PATCH between the participant's validate step and its
+  // UNCERTAIN record, and give it time to finish if nothing blocks it.
+  let patch;
+  const { svc } = service({
+    participantHooks: {
+      afterValidate: async () => {
+        if (patch) return;
+        patch = repo.updateStatus(incident.incidentId, { status: 'investigating', version: 1 }).then(
+          () => 'ok',
+          (err) => err.name,
+        );
+        await new Promise((r) => setTimeout(r, 300));
+      },
+    },
+  });
+  const upsert = await svc
+    .upsertIncident({ ...c, alertIds: [...c.alertIds, `${c.alertIds[0]}-race`] })
+    .then((ok) => ({ ok }), (err) => ({ err }));
+  const patchResult = await patch;
+
+  // Nothing may be left in flight on the Postgres participant.
+  const { rows: stuck } = await db.pool.query(
+    `SELECT tx_id, state FROM tpc_participant
+      WHERE payload->>'correlationId' = $1 AND state IN ('UNCERTAIN', 'PRECOMMITTED')`,
+    [c.correlationId],
+  );
+  assert.deepEqual(stuck, [], 'no transaction stuck after a decided commit');
+
+  const stored = await repo.getIncident(incident.incidentId);
+  if (upsert.ok) {
+    // The 3PC update won: the PATCH must have been refused, the update applied.
+    assert.equal(patchResult, 'TransactionPending');
+    assert.equal(stored.alertCount, 2);
+    assert.equal(stored.version, 2);
+    assert.equal(stored.status, 'open');
+  } else {
+    // The PATCH won: the 3PC transaction must have voted no.
+    assert.ok(upsert.err instanceof IncidentAborted, String(upsert.err));
+    assert.equal(patchResult, 'ok');
+    assert.equal(stored.alertCount, 1);
+    assert.equal(stored.status, 'investigating');
+  }
 });

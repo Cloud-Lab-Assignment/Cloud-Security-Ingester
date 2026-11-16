@@ -184,6 +184,9 @@ export function createIncidentRepo({ pool, correlationWindowMs, now = Date.now }
       if (rows.length === 0) throw new IncidentNotFound(incidentId);
       const current = rows[0];
       if (current.version !== version) throw new VersionConflict(incidentId, version, current.version);
+      // Same lock the incident-db participant holds while it votes (P0-2): wait
+      // for an in-progress vote, then see its pending record below.
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [current.correlation_id]);
       const pending = await client.query(
         `SELECT 1 FROM tpc_participant
           WHERE state IN ('UNCERTAIN', 'PRECOMMITTED') AND payload->>'correlationId' = $1 LIMIT 1`,

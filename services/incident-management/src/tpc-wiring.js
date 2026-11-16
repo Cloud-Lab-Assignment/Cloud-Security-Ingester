@@ -187,36 +187,66 @@ export async function applyDecision(pool, { txId, kind, version, incident, newAl
 
 // Vote yes only if the decision still applies cleanly: no other in-flight
 // transaction for this correlationId, and the incident is where the decision
-// expects it (absent for create, at version-1 for update).
-export async function validateDecision(pool, txId, payload) {
+// expects it (absent for create, at version-1 for update). `db` is a pool or a
+// client inside a transaction.
+export async function validateDecision(db, txId, payload) {
   if (!payload || !payload.incident || !payload.correlationId) return false;
-  const pending = await pool.query(
+  const pending = await db.query(
     `SELECT 1 FROM tpc_participant
       WHERE state IN ('UNCERTAIN', 'PRECOMMITTED') AND payload->>'correlationId' = $1 AND tx_id <> $2 LIMIT 1`,
     [payload.correlationId, txId],
   );
   if (pending.rowCount > 0) return false;
   if (payload.kind === 'create') {
-    const exists = await pool.query('SELECT 1 FROM incidents WHERE correlation_id = $1', [payload.correlationId]);
+    const exists = await db.query('SELECT 1 FROM incidents WHERE correlation_id = $1', [payload.correlationId]);
     return exists.rowCount === 0;
   }
-  const { rows } = await pool.query('SELECT version FROM incidents WHERE incident_id = $1', [payload.incident.incidentId]);
+  const { rows } = await db.query('SELECT version FROM incidents WHERE incident_id = $1', [payload.incident.incidentId]);
   return rows.length === 1 && rows[0].version === payload.version - 1;
 }
 
-export function createIncidentDbParticipant({ pool, timeoutMs, now = Date.now }) {
+// Per-incident serialisation shared by the 3PC vote and analyst PATCHes.
+export async function lockCorrelation(db, correlationId) {
+  await db.query('SELECT pg_advisory_xact_lock(hashtext($1))', [correlationId]);
+}
+
+// The incident-db participant. Its vote validates and records UNCERTAIN (or
+// ABORTED) in ONE Postgres transaction under the correlation's advisory lock,
+// so a PATCH can never slip in between "validated" and "reserved" (P0-2).
+export function createIncidentDbParticipant({ pool, timeoutMs, now = Date.now, hooks = {} }) {
+  const store = createPgParticipantStore(pool);
   const sm = createParticipant({
-    store: createPgParticipantStore(pool),
+    store,
     timeoutMs,
     now,
+    // Only reached when reserve() did not record a vote (malformed payload).
     validate: (txId, payload) => validateDecision(pool, txId, payload),
     apply: (payload) => applyDecision(pool, payload, now),
   });
-  // Fold the txId into the stored payload so apply can write it to history.
+
+  async function reserve(txId, payload) {
+    await withTransaction(pool, async (db) => {
+      await lockCorrelation(db, payload.correlationId);
+      const existing = await db.query('SELECT 1 FROM tpc_participant WHERE tx_id = $1', [txId]);
+      if (existing.rowCount > 0) return; // repeat canCommit: keep the recorded vote
+      const ok = await validateDecision(db, txId, payload);
+      await hooks.afterValidate?.(txId, payload);
+      await db.query(
+        `INSERT INTO tpc_participant (tx_id, state, payload, updated_at) VALUES ($1, $2, $3, $4)`,
+        [txId, ok ? 'UNCERTAIN' : 'ABORTED', JSON.stringify(payload), new Date(now())],
+      );
+    });
+  }
+
   return {
     name: INCIDENT_DB,
     ...sm,
-    canCommit: (txId, payload) => sm.canCommit(txId, payload && { ...payload, txId }),
+    // Fold the txId into the stored payload so apply can write it to history.
+    async canCommit(txId, payload) {
+      const withTx = payload && { ...payload, txId };
+      if (withTx && typeof withTx.correlationId === 'string' && withTx.incident) await reserve(txId, withTx);
+      return sm.canCommit(txId, withTx);
+    },
   };
 }
 
@@ -243,8 +273,9 @@ export function createIncidentService({
   metrics = createTpcMetrics(),
   onCrash = async () => {},
   now = Date.now,
+  participantHooks,
 }) {
-  const local = createIncidentDbParticipant({ pool, timeoutMs: config.tpcParticipantTimeoutMs, now });
+  const local = createIncidentDbParticipant({ pool, timeoutMs: config.tpcParticipantTimeoutMs, now, hooks: participantHooks });
 
   async function onCommitted(txId, payloads) {
     metrics.transactions.inc({ outcome: 'committed' });
