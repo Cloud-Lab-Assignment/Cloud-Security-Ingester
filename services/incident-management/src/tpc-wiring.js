@@ -251,11 +251,15 @@ export async function validateDecision(db, txId, payload) {
   return rows.length === 1 && rows[0].version === payload.version - 1;
 }
 
-// Map a coordinator log entry to the participant's resolve() answer (P0-4):
-// a final decision, PENDING while the coordinator is still driving or
-// recovering it, or null (unknown) so the participant's timeout rule applies.
+// Map a coordinator log entry to the participant's resolve() answer (P0-4,
+// R2-3): a final decision, PENDING while the coordinator is still driving or
+// recovering it, or UNKNOWN when there is no entry. The coordinator logs
+// WAITING before any canCommit, so no entry means it never started the
+// transaction (UNCERTAIN aborts; PRECOMMITTED is kept and reported). This
+// participant reads the log in-process, so "unreachable" (null) only arises
+// when the lookup itself throws.
 export function decisionOf(entry) {
-  if (!entry) return null;
+  if (!entry) return 'UNKNOWN';
   if (entry.state === 'COMMITTED' || entry.state === 'ABORTED') return entry.state;
   return 'PENDING';
 }

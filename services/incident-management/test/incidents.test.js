@@ -538,3 +538,25 @@ test('postgres store commit is atomic with the business write (R2-2)', { skip },
     assert.equal(await incidentRows(r.c), state === 'COMMITTED' ? 1 : 0, `split: state ${state}`);
   }
 });
+
+test('incident-db sweep: no coordinator entry means the tx never started (R2-3)', { skip }, async () => {
+  const { svc } = service({ config: { tpcParticipantTimeoutMs: 1 } });
+  const make = async (precommit) => {
+    const c = candidate();
+    const txId = `r23-${precommit ? 'pre' : 'unc'}-${c.correlationId}`;
+    const payload = { correlationId: c.correlationId, kind: 'create', version: 1, incident: mergeFor(c), newAlertIds: c.alertIds };
+    assert.equal(await svc.participant.canCommit(txId, payload), 'yes');
+    if (precommit) await svc.participant.preCommit(txId);
+    return { c, txId };
+  };
+  const uncertain = await make(false);
+  const precommitted = await make(true);
+  await new Promise((r) => setTimeout(r, 10));
+  await svc.participant.sweep();
+  const state = async (txId) => (await db.pool.query('SELECT state FROM tpc_participant WHERE tx_id = $1', [txId])).rows[0].state;
+  assert.equal(await state(uncertain.txId), 'ABORTED');
+  assert.equal(await state(precommitted.txId), 'PRECOMMITTED', 'never self-commit a tx the coordinator never logged');
+  const rows = (await db.pool.query('SELECT 1 FROM incidents WHERE correlation_id = $1', [precommitted.c.correlationId])).rowCount;
+  assert.equal(rows, 0);
+  await svc.participant.abort(precommitted.txId);
+});
