@@ -67,7 +67,7 @@ after(async () => {
 test('migrate is idempotent', { skip }, async () => {
   assert.deepEqual(await migrate(db.pool), []);
   const { rows } = await db.pool.query('SELECT name FROM schema_migrations');
-  assert.deepEqual(rows.map((r) => r.name).sort(), ['001_init.sql', '002_outbox.sql', '003_alert_unique.sql', '004_outbox_tx.sql', '005_outbox_tx_backfill.sql', '006_outbox_disposition.sql']);
+  assert.deepEqual(rows.map((r) => r.name).sort(), ['001_init.sql', '002_outbox.sql', '003_alert_unique.sql', '004_outbox_tx.sql', '005_outbox_tx_backfill.sql', '006_outbox_disposition.sql', '007_alert_counts.sql']);
 });
 
 test('upsertIncident commits to postgres and event-store and queues incident.created', { skip }, async () => {

@@ -119,3 +119,33 @@ test('005 backfills tx_id on pre-004 correlation outbox rows so they wait for CO
     await d.drop();
   }
 });
+
+test('007 recomputes alert_count and the generated title after the 003 dedupe (R3-5)', { skip }, async () => {
+  const d = await databaseAt('006_outbox_disposition.sql');
+  try {
+    const stale = '00000000-0000-4000-8000-0000000000d1';
+    const custom = '00000000-0000-4000-8000-0000000000d2';
+    const ins = (id, corr, count, title) =>
+      d.pool.query(
+        `INSERT INTO incidents (incident_id, correlation_id, entity_key, title, severity, alert_count, version, created_at, updated_at)
+         VALUES ($1, $2, '203.0.113.9', $3, 'high', $4, 1, now(), now())`,
+        [id, corr, title, count],
+      );
+    // 003 removed one of this incident's two associations; its count/title still say 2.
+    await ins(stale, 'cor-stale', 2, '2 correlated alert(s) for 203.0.113.9');
+    await d.pool.query(`INSERT INTO incident_alerts (incident_id, alert_id) VALUES ($1, 'only-one')`, [stale]);
+    // A title that isn't the generated pattern is left alone.
+    await ins(custom, 'cor-custom', 3, 'Analyst renamed this');
+    await d.pool.query(`INSERT INTO incident_alerts (incident_id, alert_id) VALUES ($1, 'c1')`, [custom]);
+
+    await migrate(d.pool);
+
+    const { rows } = await d.pool.query('SELECT incident_id, alert_count, title FROM incidents ORDER BY incident_id');
+    assert.deepEqual(rows, [
+      { incident_id: stale, alert_count: 1, title: '1 correlated alert(s) for 203.0.113.9' },
+      { incident_id: custom, alert_count: 1, title: 'Analyst renamed this' },
+    ]);
+  } finally {
+    await d.drop();
+  }
+});

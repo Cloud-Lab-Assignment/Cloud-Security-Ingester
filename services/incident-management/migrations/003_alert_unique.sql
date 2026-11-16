@@ -5,7 +5,7 @@
 -- incidents (R2-4). Keep the earliest association per alert_id (by the
 -- incident's created_at, then incident_id) and delete the rest, so the unique
 -- index can be created instead of crash-looping the service on startup.
--- The affected incidents' alert_count is not recomputed; it only feeds the title.
+-- The affected incidents' alert_count and title are recomputed by 007 (R3-5).
 DO $$
 DECLARE
   removed integer;
