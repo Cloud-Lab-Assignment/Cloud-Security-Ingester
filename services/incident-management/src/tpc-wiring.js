@@ -264,6 +264,18 @@ export function decisionOf(entry) {
   return 'PENDING';
 }
 
+// PRECOMMITTED participant records the coordinator has no log entry for (R3-6).
+// The coordinator logs WAITING before any canCommit, so with an intact log
+// this is 0; anything else needs an operator (see docs/handoff.md).
+export async function orphanedParticipantRecords(pool) {
+  const { rows } = await pool.query(
+    `SELECT count(*)::int AS n FROM tpc_participant p
+      WHERE p.state = 'PRECOMMITTED'
+        AND NOT EXISTS (SELECT 1 FROM tpc_coordinator c WHERE c.tx_id = p.tx_id)`,
+  );
+  return rows[0].n;
+}
+
 // Per-incident serialisation shared by the 3PC vote and analyst PATCHes.
 export async function lockCorrelation(db, correlationId) {
   await db.query('SELECT pg_advisory_xact_lock(hashtext($1))', [correlationId]);
@@ -272,12 +284,14 @@ export async function lockCorrelation(db, correlationId) {
 // The incident-db participant. Its vote validates and records UNCERTAIN (or
 // ABORTED) in ONE Postgres transaction under the correlation's advisory lock,
 // so a PATCH can never slip in between "validated" and "reserved" (P0-2).
-export function createIncidentDbParticipant({ pool, timeoutMs, now = Date.now, hooks = {}, resolve }) {
+export function createIncidentDbParticipant({ pool, timeoutMs, now = Date.now, hooks = {}, resolve, logger }) {
   const store = createPgParticipantStore(pool, { now });
   const sm = createParticipant({
     store,
     timeoutMs,
     now,
+    // Reports a PRECOMMITTED record the coordinator has no entry for (R3-6).
+    logger,
     // Before acting on a timeout, ask the coordinator log (same process) for
     // the decision; only fall back to the timeout rule when there is none.
     resolve,
@@ -342,6 +356,7 @@ export function createIncidentService({
     timeoutMs: config.tpcParticipantTimeoutMs,
     now,
     hooks: participantHooks,
+    logger,
     resolve: async (txId) => decisionOf(await coordinatorLog.get(txId)),
   });
 

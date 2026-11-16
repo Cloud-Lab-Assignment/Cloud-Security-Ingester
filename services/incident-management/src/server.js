@@ -10,6 +10,7 @@ import {
   createIncidentService,
   createPgCoordinatorLog,
   createTpcMetrics,
+  orphanedParticipantRecords,
 } from './tpc-wiring.js';
 import { startGrpc } from './grpc.js';
 import { registerRoutes } from './routes.js';
@@ -93,6 +94,19 @@ async function main() {
       registers: [app.metrics],
     }),
   };
+  new client.Gauge({
+    name: 'tpc_participant_orphaned',
+    help: 'PRECOMMITTED incident-db participant records with no coordinator log entry (needs an operator)',
+    registers: [app.metrics],
+    async collect() {
+      try {
+        this.set(await orphanedParticipantRecords(pool));
+      } catch (err) {
+        logger.warn({ err }, 'tpc_participant_orphaned query failed');
+      }
+    },
+  });
+
   const { server: grpcServer, port: grpcPort } = await startGrpc({
     port: config.grpcPort,
     upsertIncident: service.upsertIncident,

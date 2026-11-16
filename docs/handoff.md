@@ -127,6 +127,8 @@ The image bakes in the AWS RDS CA bundle at `/etc/ssl/rds/global-bundle.pem`.
 - A message held because its transaction is still **PRECOMMITTED** is never expired: recovery (every 15 s) keeps retrying the participant that hasn't acknowledged, usually the event-store. Fix that participant and the message goes out by itself.
 - To inspect by hand: `SELECT o.id, o.incident_id, o.tx_id, c.state, o.created_at FROM outbox o LEFT JOIN tpc_coordinator c USING (tx_id) WHERE o.published_at IS NULL AND o.disposition IS NULL ORDER BY o.id;` and `GET /tpc/transactions/<txId>`. Only if a transaction can never finish (e.g. its log entry was lost) drop the message with `UPDATE outbox SET disposition = 'discarded' WHERE id = <id>;`.
 
+**Orphaned 3PC records (`tpc_participant_orphaned`):** a PRECOMMITTED Postgres participant record whose transaction has no coordinator log entry. The coordinator logs every transaction before asking for votes, so this gauge should stay 0; each orphan is also logged at error level. It is never committed or aborted automatically. Check `GET /tpc/transactions/<txId>` and the event-store's correlation history, then decide by hand.
+
 **Replicas:** **exactly 1. No HPA.** It is the 3PC coordinator and runs recovery at startup; two coordinators would race on the same transactions. Use `strategy: Recreate` so a rollout never overlaps two pods. A restart is safe (recovery handles it).
 
 ---

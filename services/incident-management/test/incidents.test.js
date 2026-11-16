@@ -560,3 +560,28 @@ test('incident-db sweep: no coordinator entry means the tx never started (R2-3)'
   assert.equal(rows, 0);
   await svc.participant.abort(precommitted.txId);
 });
+
+test('orphaned PRECOMMITTED records are logged and counted (R3-6)', { skip }, async () => {
+  const { orphanedParticipantRecords } = await import('../src/tpc-wiring.js');
+  const errors = [];
+  const logger = { ...silentLogger, error: (obj, msg) => errors.push({ obj, msg }) };
+  const svc = createIncidentService({
+    pool: db.pool,
+    repo,
+    eventStore: fakeEventStore(),
+    config: { ...config, tpcParticipantTimeoutMs: 1 },
+    logger,
+  });
+  const before = await orphanedParticipantRecords(db.pool);
+  const c = candidate();
+  const txId = `r36-${c.correlationId}`;
+  const payload = { correlationId: c.correlationId, kind: 'create', version: 1, incident: mergeFor(c), newAlertIds: c.alertIds };
+  await svc.participant.canCommit(txId, payload);
+  await svc.participant.preCommit(txId); // no coordinator entry: an orphan
+  await new Promise((r) => setTimeout(r, 10));
+  await svc.participant.sweep();
+  assert.ok(errors.some((e) => JSON.stringify(e).includes(txId)), 'the orphan is logged at error level');
+  assert.equal(await orphanedParticipantRecords(db.pool), before + 1);
+  await svc.participant.abort(txId);
+  assert.equal(await orphanedParticipantRecords(db.pool), before);
+});
