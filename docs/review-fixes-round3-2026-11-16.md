@@ -16,7 +16,7 @@ When done, run the full suite and the demo, push to `origin main`, and append a 
 Round-2 verdicts:
 - **Fixed:** R2-3 (event-store side).
 - **Partially fixed:** R2-1, R2-2, R2-3 (incident-db logging), R2-4, R2-5. These are covered below.
-- **R2-6 to R2-9:** still under review. A section will be appended below if needed.
+- **R2-6 to R2-9:** see the section near the end.
 
 ---
 
@@ -73,7 +73,24 @@ Round-2 verdicts:
 
 ## R2-6 to R2-9 findings
 
-_Pending: the third reviewer is still running. Appended here if it finds anything._
+Third reviewer verdicts:
+- **Fixed:** R2-6, R2-7, R2-8.
+- **Partially fixed:** R2-9. Its "never writes ABORTED over PRECOMMITTED" finding is already covered by R3-7.
+
+### R3-8 Demo can move on before phase 3 finishes
+- **Where:** `scripts/demo-3pc.sh:118` waits only for the Postgres incident row.
+- **Problem:** the row can show up while the Event Store's concurrent commit is still running. The script then prints `PRECOMMITTED` or hits a correlation-history 404 and exits.
+- **Fix:** add a helper that polls until the coordinator log shows `COMMITTED` for the tx **and** `GET /correlations/:id` returns the matching version. Use it in every scenario that ends in a commit, including after recovery in scenario 3. Re-record the output in `docs/handoff.md`.
+
+### R3-9 README has no clear "run it" path
+- **Where:** `README.md:14`.
+- **Fix:** add a short "Run it locally" section at the top that links to the "Local run" section of `docs/handoff.md` and to `scripts/demo-3pc.sh`. Under "Start here", keep the brief, then mark the plan and review rounds 1 to 3 as history, with "done" against each.
+
+### R3-10 Cursor docs describe the wrong key
+- **Where:** `docs/handoff.md:37`.
+- **Fix:** describe the cursor as opaque. Its decoded `entityKey` is `storageKey(entityKey)`, which is the hashed form for long keys and for literal `h:` keys. Clients must pass the `nextCursor` back unchanged.
+
+**For Rishit, not the box:** fill in the ID number in `docs/task_division_rishit.txt`.
 
 ## Done log
 
