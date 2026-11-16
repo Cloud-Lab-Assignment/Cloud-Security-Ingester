@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { DynamoDBClient, DescribeTableCommand } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { StoreConflict } from '@core/tpc';
@@ -52,6 +53,18 @@ export function decodeCursor(cursor, entityKey) {
   return { entityKey: key.entityKey, sk: key.sk };
 }
 
+// DynamoDB limits a partition key to 2048 bytes (and a sort key to 1024).
+// Upstream allows longer entity keys (e.g. a 3000-byte source.name), so keys
+// over MAX_ENTITY_KEY_BYTES of UTF-8 are stored as "h:" + sha256 hex. The
+// original stays in the item (`doc`, and `entityKeyOriginal`), and queries
+// apply the same mapping, so callers only ever see the original key.
+export const MAX_ENTITY_KEY_BYTES = 1024;
+
+export function storageKey(entityKey) {
+  if (Buffer.byteLength(entityKey, 'utf8') <= MAX_ENTITY_KEY_BYTES) return entityKey;
+  return `h:${createHash('sha256').update(entityKey, 'utf8').digest('hex')}`;
+}
+
 const isConditionFailure = (err) => err?.name === 'ConditionalCheckFailedException';
 
 // Canonical millisecond ISO form so sort keys compare correctly as strings.
@@ -62,8 +75,10 @@ const canonicalTime = (t) => new Date(t).toISOString();
 // entityKey/sk/eventId/eventTime/category/outcome are top-level for keys and filtering.
 function toEventItem(event) {
   const eventTime = canonicalTime(event.eventTime);
+  const key = storageKey(event.entityKey);
   return {
-    entityKey: event.entityKey,
+    entityKey: key,
+    ...(key === event.entityKey ? {} : { entityKeyOriginal: event.entityKey }),
     sk: `${eventTime}#${event.eventId}`,
     eventId: event.eventId,
     eventTime,
@@ -115,18 +130,19 @@ export function createDynamoRepo({ doc, tablePrefix }) {
 
   // Events for one entity with from <= eventTime <= to, oldest first.
   async function queryEvents({ entityKey, from, to, limit = 100, cursor }) {
+    const key = storageKey(entityKey);
     const out = await doc.send(
       new QueryCommand({
         TableName: tables.events,
         KeyConditionExpression: 'entityKey = :e AND sk BETWEEN :from AND :toMax',
         ExpressionAttributeValues: {
-          ':e': entityKey,
+          ':e': key,
           ':from': canonicalTime(from),
           ':toMax': `${canonicalTime(to)}#￿`,
         },
         Limit: limit,
         ScanIndexForward: true,
-        ...(cursor ? { ExclusiveStartKey: decodeCursor(cursor, entityKey) } : {}),
+        ...(cursor ? { ExclusiveStartKey: decodeCursor(cursor, key) } : {}),
       }),
     );
     return {

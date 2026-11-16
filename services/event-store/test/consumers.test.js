@@ -123,16 +123,26 @@ test('storage errors are thrown so kafkajs retries', async () => {
   await assert.rejects(deliver('raw-events', JSON.stringify(rawEvent())), /s3 down/);
 });
 
-test('a DynamoDB ValidationException (e.g. oversized item) is skipped, not retried', async () => {
+test('a DynamoDB ValidationException (e.g. oversized item) is skipped, not retried, but never silently', async () => {
   const err = Object.assign(new Error('Item size has exceeded the maximum allowed size'), {
     name: 'ValidationException',
   });
-  const { deliver } = await setup({
+  const errors = [];
+  const logger = { ...silentLogger(), error: (obj, msg) => errors.push({ obj, msg }) };
+  const { deliver, registry } = await setup({
+    logger,
     putEvent: async () => {
       throw err;
     },
   });
-  await deliver('normalized-events', JSON.stringify(normalizedEvent()));
+  const ev = normalizedEvent();
+  await deliver('normalized-events', JSON.stringify(ev));
+  assert.equal(errors.length, 1);
+  assert.deepEqual(
+    { topic: errors[0].obj.topic, partition: errors[0].obj.partition, offset: errors[0].obj.offset, eventId: errors[0].obj.eventId },
+    { topic: 'normalized-events', partition: 0, offset: '1', eventId: ev.eventId },
+  );
+  assert.match(await registry.metrics(), /events_consumed_total\{topic="normalized-events",result="invalid"\} 1/);
 });
 
 test('events_consumed_total counts results', async () => {

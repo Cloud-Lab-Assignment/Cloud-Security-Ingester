@@ -1,7 +1,7 @@
 import client from 'prom-client';
 import { buildApp, isIsoTimestamp, isoTimestamp } from '@core/common';
 import { TpcStateError } from '@core/tpc';
-import { decodeCursor, InvalidCursorError } from './dynamo.js';
+import { decodeCursor, InvalidCursorError, storageKey } from './dynamo.js';
 import { SERVICE_NAME } from './config.js';
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -31,7 +31,7 @@ function parseEventsQuery(q, now) {
   }
   if (cursor !== undefined) {
     try {
-      decodeCursor(cursor, entityKey);
+      decodeCursor(cursor, storageKey(entityKey));
     } catch {
       return { error: 'cursor is invalid' };
     }

@@ -1,6 +1,6 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { DeleteTableCommand } from '@aws-sdk/client-dynamodb';
 import {
   createDynamoClients,
@@ -9,6 +9,8 @@ import {
   decodeCursor,
   tableNames,
   InvalidCursorError,
+  storageKey,
+  MAX_ENTITY_KEY_BYTES,
 } from '../src/dynamo.js';
 import { ensureLocalResources } from '../src/local-setup.js';
 import { StoreConflict, TpcStateError } from '@core/tpc';
@@ -35,6 +37,16 @@ test('cursor must be exactly string {entityKey, sk}, for the expected entity', (
   }
   assert.throws(() => decodeCursor(encodeCursor({ entityKey: 'y', sk }), 'x'), InvalidCursorError);
   assert.deepEqual(decodeCursor(encodeCursor({ sk, entityKey: 'x' }), 'x'), { entityKey: 'x', sk });
+});
+
+test('storageKey keeps keys up to 1024 UTF-8 bytes and hashes longer ones', () => {
+  assert.equal(storageKey('10.0.0.5'), '10.0.0.5');
+  const max = 'a'.repeat(MAX_ENTITY_KEY_BYTES);
+  assert.equal(storageKey(max), max);
+  const long = 'a'.repeat(MAX_ENTITY_KEY_BYTES + 1);
+  assert.equal(storageKey(long), `h:${createHash('sha256').update(long, 'utf8').digest('hex')}`);
+  // Bytes, not characters: 600 two-byte characters is 1200 bytes.
+  assert.match(storageKey('é'.repeat(600)), /^h:[0-9a-f]{64}$/);
 });
 
 test('tableNames uses the prefix', () => {
@@ -130,6 +142,21 @@ describe('dynamodb repo (integration)', { skip: !process.env.INTEGRATION }, () =
     assert.equal(page2.items[0].eventTime, '2026-11-16T05:02:00.000Z');
     // Another entity's cursor is rejected before it reaches DynamoDB.
     await assert.rejects(repo.queryEvents({ ...q, entityKey: `k-${randomUUID()}`, cursor: page1.nextCursor }), InvalidCursorError);
+  });
+
+  test('an entityKey over the DynamoDB key limit is stored under its hash and queryable by the original', async () => {
+    const entityKey = `${'é'.repeat(1400)}-${randomUUID()}`; // ~2.8 KB of UTF-8
+    const evs = [0, 1, 2].map((i) => normalizedEvent({ entityKey, eventTime: `2026-11-16T05:0${i}:00.000Z` }));
+    for (const ev of evs) assert.equal(await repo.putEvent(ev), 'stored');
+    assert.equal(await repo.putEvent(evs[0]), 'duplicate');
+    assert.deepEqual(await repo.getEvent(evs[1].eventId), evs[1]);
+    const q = { entityKey, from: '2026-11-16T05:00:00.000Z', to: '2026-11-16T06:00:00.000Z', limit: 2 };
+    const page1 = await repo.queryEvents(q);
+    assert.deepEqual(page1.items, evs.slice(0, 2));
+    const page2 = await repo.queryEvents({ ...q, cursor: page1.nextCursor });
+    assert.deepEqual(page2.items, evs.slice(2));
+    // A different long key with the same prefix is a different partition.
+    assert.deepEqual((await repo.queryEvents({ ...q, entityKey: `${entityKey}x` })).items, []);
   });
 
   test('putCorrelation stores versions once, getCorrelation orders by version', async () => {

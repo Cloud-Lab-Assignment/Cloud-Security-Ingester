@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildServer } from '../src/routes.js';
 import { createCorrelationParticipant, validateCorrelationPayload } from '../src/participant.js';
-import { encodeCursor, InvalidCursorError } from '../src/dynamo.js';
+import { encodeCursor, InvalidCursorError, storageKey } from '../src/dynamo.js';
 import { fakeRepo, normalizedEvent, correlationPayload } from './helpers.js';
 
 const NOW = Date.parse('2026-11-16T06:00:00.000Z');
@@ -131,6 +131,17 @@ test('GET /events rejects cursors that are not exactly {entityKey, sk} for this 
     assert.equal(res.json().error, 'bad_request');
   }
   assert.equal(repo.calls.queryEvents.length, 0);
+});
+
+test('GET /events with an oversized entityKey accepts cursors for its hashed storage key', async () => {
+  const { app, repo } = setup();
+  const entityKey = 'u'.repeat(3000);
+  const cursor = encodeCursor({ entityKey: storageKey(entityKey), sk: '2026-11-16T05:10:00.000Z#e' });
+  const res = await app.inject(`/events?entityKey=${entityKey}&cursor=${cursor}`);
+  assert.equal(res.statusCode, 200);
+  assert.equal(repo.calls.queryEvents[0].entityKey, entityKey);
+  const raw = encodeCursor({ entityKey, sk: '2026-11-16T05:10:00.000Z#e' });
+  assert.equal((await app.inject(`/events?entityKey=${entityKey}&cursor=${raw}`)).statusCode, 400);
 });
 
 test('GET /events maps an InvalidCursorError from the repo to 400', async () => {
