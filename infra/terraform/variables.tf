@@ -35,7 +35,7 @@ variable "gke_node_min" {
 variable "gke_node_max" {
   description = "Max nodes; must leave room for HPA scale-out during the load test"
   type        = number
-  default     = 5
+  default     = 3
 }
 
 variable "cloudsql_tier" {
