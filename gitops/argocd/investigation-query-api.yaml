@@ -1,0 +1,18 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: investigation-query-api
+  namespace: argocd
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ashkew2202/Cloud-Security-Ingester.git
+    targetRevision: main
+    path: gitops/services/investigation-query-api
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cloud-sec
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true]

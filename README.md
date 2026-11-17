@@ -1,3 +1,22 @@
+# Cloud Security Monitoring (CS G527, scenario S25, concept: 3PC)
+
+Eight microservices on AWS: Log Ingestion, Event Normalizer (Lambda), Detection Rules, Security Analytics (Flink on EMR),
+Correlation Engine, Event Store, Incident Management, Investigation Query API.
+Infrastructure is Terraform (`infra/terraform`), deployments are ArgoCD from `gitops/`, images are built by `.github/workflows/ci.yml`.
+
+| Path | Contents |
+|---|---|
+| `services/` | all eight services (`event-normalizer` = Lambda, `security-analytics` = Flink job) |
+| `packages/`, `proto/` | shared libraries (`@core/common`, `@core/tpc`) and the gRPC contract |
+| `infra/terraform/` | platform (VPC, EKS, MSK, Lambda, EMR, ArgoCD, monitoring) + `modules/core-data` (DynamoDB, S3, RDS) |
+| `gitops/` | ArgoCD Applications, Kustomize manifests, HPAs, Grafana dashboard |
+| `loadtest/` | k6 load test for the HPA demo |
+| `docs/DEPLOYMENT.md` | **step-by-step deployment and demo guide** |
+| `docs/handoff.md`, `docs/design/` | core services contracts and design (Rishit) |
+| `docs/task_division.txt` | who did what |
+
+---
+
 # Cloud Security Monitoring: core services
 
 My part of the CS G527 Cloud Computing group assignment (scenario S25, Cloud Security Monitoring; concept: 3PC).

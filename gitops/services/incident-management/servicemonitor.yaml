@@ -1,0 +1,11 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: incident-management
+  namespace: cloud-sec
+  labels: {release: monitoring}
+spec:
+  selector:
+    matchLabels: {app: incident-management}
+  endpoints:
+    - {port: http, path: /metrics, interval: 15s}

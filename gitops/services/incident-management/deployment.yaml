@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: incident-management
+  namespace: cloud-sec
+  labels: {app: incident-management, app.kubernetes.io/part-of: cloud-security-monitoring}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}   # never two pods at once (3PC coordinator)
+  selector:
+    matchLabels: {app: incident-management}
+  template:
+    metadata:
+      labels: {app: incident-management}
+    spec:
+      containers:
+        - name: incident-management
+          image: ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/cloud-sec/incident-management:latest
+          ports:
+            - {name: http, containerPort: 8082}
+            - {name: grpc, containerPort: 50051}
+          envFrom:
+            - configMapRef: {name: infra-endpoints}
+            - secretRef: {name: incident-db}
+          env:
+            - {name: NODE_ENV, value: production}
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            failureThreshold: 24
+          resources:
+            # HPA utilisation is measured against these requests
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 384Mi}

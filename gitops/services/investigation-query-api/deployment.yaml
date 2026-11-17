@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: investigation-query-api
+  namespace: cloud-sec
+  labels: {app: investigation-query-api, app.kubernetes.io/part-of: cloud-security-monitoring}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: investigation-query-api}
+  template:
+    metadata:
+      labels: {app: investigation-query-api}
+    spec:
+      containers:
+        - name: investigation-query-api
+          image: ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/cloud-sec/investigation-query-api:latest
+          ports:
+            - {name: http, containerPort: 8084}
+          envFrom:
+            - configMapRef: {name: infra-endpoints}
+          env:
+            - {name: NODE_ENV, value: production}
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            failureThreshold: 24
+          resources:
+            # HPA utilisation is measured against these requests
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 384Mi}

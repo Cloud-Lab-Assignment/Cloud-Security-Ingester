@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: correlation-engine
+  namespace: cloud-sec
+  labels: {app: correlation-engine, app.kubernetes.io/part-of: cloud-security-monitoring}
+spec:
+  # no replicas field: the HPA owns scaling
+  selector:
+    matchLabels: {app: correlation-engine}
+  template:
+    metadata:
+      labels: {app: correlation-engine}
+    spec:
+      containers:
+        - name: correlation-engine
+          image: ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/cloud-sec/correlation-engine:latest
+          ports:
+            - {name: http, containerPort: 8083}
+          envFrom:
+            - configMapRef: {name: infra-endpoints}
+          env:
+            - {name: NODE_ENV, value: production}
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            failureThreshold: 24
+          resources:
+            # HPA utilisation is measured against these requests
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 384Mi}

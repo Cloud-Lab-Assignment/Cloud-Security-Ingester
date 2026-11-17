@@ -12,7 +12,8 @@
     "packages/tpc",
     "services/event-store",
     "services/incident-management",
-    "services/correlation-engine"
+    "services/correlation-engine",
+    "services/investigation-query-api"
   ],
   "scripts": {
     "test": "npm test --workspaces --if-present",

@@ -1,0 +1,18 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: event-store
+  namespace: argocd
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ashkew2202/Cloud-Security-Ingester.git
+    targetRevision: main
+    path: gitops/services/event-store
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cloud-sec
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true]

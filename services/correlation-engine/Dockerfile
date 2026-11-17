@@ -12,6 +12,7 @@ COPY --chmod=a+rX packages/tpc/package.json packages/tpc/package.json
 COPY --chmod=a+rX services/event-store/package.json services/event-store/package.json
 COPY --chmod=a+rX services/incident-management/package.json services/incident-management/package.json
 COPY --chmod=a+rX services/correlation-engine/package.json services/correlation-engine/package.json
+COPY --chmod=a+rX services/investigation-query-api/package.json services/investigation-query-api/package.json
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --chmod=a+rX packages/ packages/

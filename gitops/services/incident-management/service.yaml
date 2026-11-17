@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: incident-management
+  namespace: cloud-sec
+  labels: {app: incident-management}
+spec:
+  type: ClusterIP
+  selector: {app: incident-management}
+  ports:
+    - {name: http, port: 8082, targetPort: http}
+    - {name: grpc, port: 50051, targetPort: grpc}

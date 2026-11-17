@@ -6,11 +6,14 @@ import {
   disconnectKafka
 } from './services/kafka.js';
 import { eventRoutes } from './routes/events.js';
+import { registerMetrics } from './metrics.js';
 
 const app = Fastify({
   logger: true,
   bodyLimit: 1024 * 1024
 });
+
+registerMetrics(app, env.KAFKA_CLIENT_ID);
 
 app.get('/health', async () => {
   return {

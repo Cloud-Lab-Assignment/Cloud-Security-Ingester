@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: log-ingestion
+  namespace: cloud-sec
+  labels: {app: log-ingestion, app.kubernetes.io/part-of: cloud-security-monitoring}
+spec:
+  # no replicas field: the HPA owns scaling
+  selector:
+    matchLabels: {app: log-ingestion}
+  template:
+    metadata:
+      labels: {app: log-ingestion}
+    spec:
+      containers:
+        - name: log-ingestion
+          image: ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/cloud-sec/log-ingestion:latest
+          ports:
+            - {name: http, containerPort: 3000}
+          envFrom:
+            - configMapRef: {name: infra-endpoints}
+          env:
+            - {name: NODE_ENV, value: production}
+            - {name: PORT, value: "3000"}
+            - {name: HOST, value: 0.0.0.0}
+            - {name: TOPIC_RAW_EVENTS, value: raw-events}
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            failureThreshold: 24
+          resources:
+            # HPA utilisation is measured against these requests
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 384Mi}

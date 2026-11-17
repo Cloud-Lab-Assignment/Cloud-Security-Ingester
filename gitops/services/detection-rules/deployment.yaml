@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: detection-rules
+  namespace: cloud-sec
+  labels: {app: detection-rules, app.kubernetes.io/part-of: cloud-security-monitoring}
+spec:
+  # no replicas field: the HPA owns scaling
+  selector:
+    matchLabels: {app: detection-rules}
+  template:
+    metadata:
+      labels: {app: detection-rules}
+    spec:
+      containers:
+        - name: detection-rules
+          image: ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/cloud-sec/detection-rules:latest
+          envFrom:
+            - configMapRef: {name: infra-endpoints}
+          env:
+            - {name: NODE_ENV, value: production}
+            - {name: INPUT_TOPIC, value: normalized-events}
+            - {name: ALERT_TOPIC, value: security-alerts}
+          # Kafka consumer only: no HTTP server, so no probes / Service.
+          resources:
+            # HPA utilisation is measured against these requests
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 384Mi}

@@ -1,0 +1,11 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: investigation-query-api
+  namespace: cloud-sec
+  labels: {release: monitoring}
+spec:
+  selector:
+    matchLabels: {app: investigation-query-api}
+  endpoints:
+    - {port: http, path: /metrics, interval: 15s}

@@ -1,0 +1,11 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: log-ingestion
+  namespace: cloud-sec
+  labels: {release: monitoring}
+spec:
+  selector:
+    matchLabels: {app: log-ingestion}
+  endpoints:
+    - {port: http, path: /metrics, interval: 15s}
