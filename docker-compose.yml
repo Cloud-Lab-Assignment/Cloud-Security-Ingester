@@ -1,0 +1,200 @@
+# Local development stack for the core services.
+# Infra: Kafka (KRaft, single node), topic-init, Postgres, DynamoDB Local, S3 mock.
+# Services: event-store, incident-management, correlation-engine (built from this workspace).
+#
+# 3PC demo toggles (see scripts/demo-3pc.sh):
+#   ES_TPC_FORCE_VOTE=no                    event-store votes no on every transaction
+#   IM_TPC_FAULT=crash-after-precommit      incident-management exits after all preCommit acks
+name: cs-core
+
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    hostname: kafka
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      start_period: 20s
+      retries: 10
+
+  topic-init:
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        for t in raw-events normalized-events security-alerts incident-updates; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --partitions 3 --replication-factor 1 --topic "$$t"
+        done
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic incident-updates > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine@sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: incidents
+      POSTGRES_USER: incidents
+      POSTGRES_PASSWORD: incidents
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U incidents -d incidents"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:2.5.2
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      # Any HTTP response (DynamoDB answers 400 to a bare GET) means it is up.
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://localhost:8000 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # S3-compatible object store for local runs. The plan pinned MinIO, but its
+  # images are no longer published; Rishit chose adobe/s3mock instead.
+  # Host port 9000 keeps S3_ENDPOINT=http://localhost:9000 for code run on the host;
+  # inside the compose network use http://s3mock:9090.
+  s3mock:
+    image: adobe/s3mock:5.2.3
+    ports:
+      - "9000:9090"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9090"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 10
+
+  event-store:
+    build:
+      context: .
+      dockerfile: services/event-store/Dockerfile
+    image: event-store:dev
+    ports:
+      - "8081:8081"
+    environment:
+      PORT: 8081
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      KAFKA_BROKERS: kafka:9092
+      AWS_REGION: ap-south-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      DYNAMODB_ENDPOINT: http://dynamodb-local:8000
+      S3_ENDPOINT: http://s3mock:9090
+      RAW_BUCKET: cs-raw-events
+      TABLE_PREFIX: cs-
+      TPC_TIMEOUT_MS: 10000
+      TPC_FORCE_VOTE: ${ES_TPC_FORCE_VOTE:-}
+      # Ask the coordinator for its decision before acting on a 3PC timeout (P0-4).
+      COORDINATOR_URL: http://incident-management:8082
+    depends_on:
+      kafka:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+      dynamodb-local:
+        condition: service_healthy
+      s3mock:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8081/ready || exit 1"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 20
+
+  incident-management:
+    build:
+      context: .
+      dockerfile: services/incident-management/Dockerfile
+    image: incident-management:dev
+    ports:
+      - "8082:8082"
+      - "50051:50051"
+    environment:
+      PORT: 8082
+      GRPC_PORT: 50051
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgres://incidents:incidents@postgres:5432/incidents
+      DATABASE_SSL: "false"
+      KAFKA_BROKERS: kafka:9092
+      EVENT_STORE_URL: http://event-store:8081
+      INCIDENT_TOPIC: incident-updates
+      TPC_TIMEOUT_MS: 3000
+      TPC_PARTICIPANT_TIMEOUT_MS: 10000
+      TPC_FAULT: ${IM_TPC_FAULT:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+      event-store:
+        condition: service_healthy
+    # No automatic restart: the 3PC crash demo shows the exit, then restarts it
+    # by hand without the fault so recover() finishes the transaction.
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8082/ready || exit 1"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 20
+
+  correlation-engine:
+    build:
+      context: .
+      dockerfile: services/correlation-engine/Dockerfile
+    image: correlation-engine:dev
+    ports:
+      - "8083:8083"
+    environment:
+      PORT: 8083
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      KAFKA_BROKERS: kafka:9092
+      INCIDENT_GRPC_ADDR: incident-management:50051
+      EVENT_STORE_URL: http://event-store:8081
+      CORRELATION_WINDOW_MS: 900000
+      ESCALATE_ALERT_COUNT: 3
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+      event-store:
+        condition: service_healthy
+      incident-management:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8083/ready || exit 1"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 20
