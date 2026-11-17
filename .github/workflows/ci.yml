@@ -46,9 +46,28 @@ jobs:
       - run: mvn -q -B test
         working-directory: services/security-analytics
 
+  # Secrets can't be tested in a job-level `if`, so check them here once.
+  publish-config:
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - id: check
+        env:
+          KEY: ${{ secrets.GCP_SA_KEY }}
+          PROJECT: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          if [ -n "$KEY" ] && [ -n "$PROJECT" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Image publishing skipped: set the GCP_SA_KEY secret and GCP_PROJECT_ID variable (docs/DEPLOYMENT.md section 4)."
+          fi
+
   images:
-    needs: test
-    if: github.event_name == 'push'
+    needs: [test, publish-config]
+    # Skipped (not failed) until the GCP_SA_KEY secret and GCP_PROJECT_ID variable exist.
+    if: github.event_name == 'push' && needs.publish-config.outputs.ready == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
