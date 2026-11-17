@@ -29,6 +29,12 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - name: detection-rules tests
+        run: npm ci && KAFKA_BROKERS=localhost:9092 node --test
+        working-directory: services/detection-rules
+      - name: event-normalizer tests
+        run: npm ci && KAFKA_BROKERS=localhost:9092 node --test
+        working-directory: services/event-normalizer
       - name: security-analytics (Flink job) unit tests
         uses: actions/setup-java@v4
         with:

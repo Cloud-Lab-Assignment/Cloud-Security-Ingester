@@ -110,7 +110,6 @@ resource "aws_emr_cluster" "flink" {
         "taskmanager.numberOfTaskSlots" = "2"
         "state.backend"                 = "rocksdb"
         "state.checkpoints.dir"         = "s3://${aws_s3_bucket.artifacts.id}/flink-checkpoints"
-        "execution.checkpointing.mode"  = "EXACTLY_ONCE"
       }
     }
   ])

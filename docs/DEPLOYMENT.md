@@ -24,6 +24,18 @@ Requirement map: REST + gRPC + Kafka are all used (a); one Lambda (b); HPAs on l
 - Fork/clone of the GitHub repo you will push to. The repo URL is a Terraform variable (`gitops_repo_url`); ArgoCD must be able to read it, so use a **public** repo (or add repo credentials to ArgoCD).
 - You do not need `kubectl` locally. Where a cluster command is unavoidable use **AWS CloudShell** (browser terminal with kubectl) after `aws eks update-kubeconfig ...` (printed by Terraform).
 
+## 1b. Test locally first (no AWS, about 5 minutes)
+
+```bash
+npm ci && npm test                                   # unit tests (use Node 22)
+docker compose -f docker-compose.yml -f docker-compose.full.yml up -d --build
+scripts/e2e-local.sh                                 # 6 failed logins -> incident via the query API
+docker run --rm -v "$PWD/loadtest:/lt:ro" grafana/k6 run -e PROFILE=smoke   -e BASE_URL=http://host.docker.internal:3000 /lt/ingest-load.js
+docker compose -f docker-compose.yml -f docker-compose.full.yml down -v
+```
+
+This runs every service except the Flink job (the Lambda handler is driven by a local Kafka consumer). Verified on 17 Nov 2026: e2e PASS, k6 smoke 0% errors.
+
 ## 2. Provision the infrastructure
 
 ```bash
@@ -83,7 +95,7 @@ git commit -am "gitops: deploy $TAG" && git push origin main
 ```bash
 cd services/security-analytics && mvn -q package -DskipTests
 BUCKET=$(terraform -chdir=../../infra/terraform output -raw artifacts_bucket)
-aws s3 cp target/*.jar s3://$BUCKET/artifacts/security-analytics.jar   # use the shaded (non -original) jar
+aws s3 cp target/security-analytics-1.0.0.jar s3://$BUCKET/artifacts/security-analytics.jar   # the shaded jar, not original-*.jar
 ```
 
 The cluster submits the job as a step at creation. If the jar was not uploaded yet that step failed (harmless): re-submit from the **EMR console -> your cluster -> Steps -> Add step** (type Custom JAR, JAR `command-runner.jar`, arguments = the same `flink run -m yarn-cluster -d ...` line shown in `infra/terraform/emr.tf`), or `aws emr add-steps`. Confirm in the EMR console (Application user interfaces -> Flink) that the job is RUNNING.
@@ -133,10 +145,10 @@ If the destroy stalls on the VPC, delete leftover load balancers / ENIs in the E
 
 ## 10. Known limits and caveats
 
-- **Terraform was not validated or applied** in this workspace (no Terraform installed). Run `terraform fmt && terraform validate` first and expect to fix small provider-version issues.
+- **Terraform passes `terraform validate` (1.9) but has never been applied.** Validation checks syntax and references only; expect the first real `apply` to surface AWS-side issues (quotas, instance availability, EMR/MSK version support in your region).
 - Kafka uses MSK's VPC-only plaintext listener (no SASL) because upstream services and the Flink job connect without credentials. Rishit's services support SASL/TLS through `KAFKA_*` env vars if you later switch to Confluent Cloud.
 - The RDS password is copied into a Kubernetes Secret by Terraform (so it is in Terraform state). Keep state private. Production alternative: External Secrets Operator.
 - `investigation-query-api` and `log-ingestion` are public and unauthenticated (demo). Add auth/WAF for anything real.
 - `services/*/node_modules` are committed upstream (1,300+ files). Remove them from Git (`git rm -r --cached`) once the Lambda packaging runs `npm ci` in CI.
-- `incident-management` test "recovery does not abort a tx that run() committed" is timing-sensitive and failed once in a full-suite run on Windows (passes alone).
+- One `@core/tpc` test ("recovery does not abort a tx that run() committed...") fails on Node 24 / Windows and passes 77/77 on Node 22 / Linux, which is what the images and CI use. Run tests on Node 22.
 - Only `RULE-AUTH-001` exists in detection-rules; the escalation path needs 3 alerts for one entity more than 60 s apart.

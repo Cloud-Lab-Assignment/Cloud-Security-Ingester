@@ -9,7 +9,7 @@ data "archive_file" "normalizer" {
   type        = "zip"
   source_dir  = "${path.module}/../../services/event-normalizer"
   output_path = "${path.module}/.build/event-normalizer.zip"
-  excludes    = ["test", ".env", ".env.example", "package-lock.json"]
+  excludes    = ["test", "scripts", ".env", ".env.example", "package-lock.json"]
 }
 
 resource "aws_cloudwatch_log_group" "normalizer" {

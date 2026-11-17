@@ -45,7 +45,7 @@ variable "eks_node_min" {
 variable "eks_node_max" {
   description = "Max nodes; must leave room for HPA scale-out during the load test"
   type        = number
-  default = 6
+  default     = 6
 }
 
 variable "eks_node_desired" {

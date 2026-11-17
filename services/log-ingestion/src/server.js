@@ -13,7 +13,7 @@ const app = Fastify({
   bodyLimit: 1024 * 1024
 });
 
-registerMetrics(app, env.KAFKA_CLIENT_ID);
+registerMetrics(app, 'log-ingestion');
 
 app.get('/health', async () => {
   return {

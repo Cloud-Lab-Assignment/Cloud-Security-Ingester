@@ -1,0 +1,100 @@
+# Adds the upstream services and the query API to the core stack, so the whole
+# pipeline runs locally (the Flink job is the only piece left out):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.full.yml up -d --build
+#   scripts/e2e-local.sh          # sends events, waits for the incident
+#
+# log-ingestion :3000 -> raw-events -> normalizer (Lambda handler, local runner)
+#   -> normalized-events -> detection-rules -> security-alerts -> correlation-engine
+#   -> (gRPC) incident-management <-3PC-> event-store ; investigation-query-api :8084 reads both.
+services:
+  topic-init-extra:
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        for t in raw-events-dlq normalized-events-dlq results; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --partitions 3 --replication-factor 1 --topic "$$t"
+        done
+
+  log-ingestion:
+    build:
+      context: services/log-ingestion
+    image: log-ingestion:dev
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      KAFKA_BROKERS: kafka:9092
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/ready || exit 1"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 20
+
+  event-normalizer:
+    # The Lambda handler, driven by a local Kafka consumer instead of the MSK trigger.
+    image: node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a
+    working_dir: /app
+    command: ["node", "scripts/local-runner.js"]
+    volumes:
+      - ./services/event-normalizer:/app:ro
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_SSL: "false"
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+      topic-init-extra:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  detection-rules:
+    build:
+      context: services/detection-rules
+    image: detection-rules:dev
+    environment:
+      NODE_ENV: production
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_SSL: "false"
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+      topic-init-extra:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  investigation-query-api:
+    build:
+      context: .
+      dockerfile: services/investigation-query-api/Dockerfile
+    image: investigation-query-api:dev
+    ports:
+      - "8084:8084"
+    environment:
+      PORT: 8084
+      EVENT_STORE_URL: http://event-store:8081
+      INCIDENT_MANAGEMENT_URL: http://incident-management:8082
+    depends_on:
+      event-store:
+        condition: service_healthy
+      incident-management:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8084/ready || exit 1"]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 20

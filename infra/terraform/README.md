@@ -15,4 +15,4 @@ Root module = platform; `modules/core-data` = data layer for the core services (
 | `outputs.tf` | endpoints and hostnames |
 
 Apply order and everything else: [docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md). The module's own notes: [modules/core-data/README.md](modules/core-data/README.md).
-Run `terraform fmt && terraform validate` before the first apply (not yet run in this workspace).
+`terraform validate` passes (Terraform 1.9, via Docker); nothing has been applied to AWS yet.
