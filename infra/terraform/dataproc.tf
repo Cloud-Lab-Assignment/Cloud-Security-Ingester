@@ -90,6 +90,12 @@ resource "google_dataproc_cluster" "flink" {
     }
   }
 
+  # Dataproc adds its own default scopes, so the stored list never matches the
+  # config; without this every apply would delete and recreate the cluster.
+  lifecycle {
+    ignore_changes = [cluster_config[0].gce_cluster_config[0].service_account_scopes]
+  }
+
   depends_on = [
     google_project_iam_member.dataproc_worker,
     google_storage_bucket_iam_member.dataproc_artifacts,
