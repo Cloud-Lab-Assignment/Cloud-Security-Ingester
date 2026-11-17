@@ -47,9 +47,10 @@ public class SecurityAnalyticsJob {
         env.setRestartStrategy(
                 RestartStrategies.fixedDelayRestart(
                         AnalyticsConfig.RESTART_ATTEMPTS,
+                        // long overload: the Duration one does not exist in Flink 1.17
                         Duration.ofSeconds(
                                 AnalyticsConfig.RESTART_DELAY_SECONDS
-                        )
+                        ).toMillis()
                 )
         );
 

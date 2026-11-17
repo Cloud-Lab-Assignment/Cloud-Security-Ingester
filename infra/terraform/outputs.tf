@@ -1,36 +1,28 @@
-output "eks_cluster_name" {
-  value = module.eks.cluster_name
+output "gke_get_credentials" {
+  description = "Only needed for optional kubectl access (e.g. from Cloud Shell)"
+  value       = "gcloud container clusters get-credentials ${google_container_cluster.main.name} --zone ${var.gcp_zone} --project ${var.gcp_project_id}"
 }
 
-output "kubeconfig_command" {
-  value = "aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}"
+output "image_registry" {
+  description = "Artifact Registry path; scripts/set-registry.sh writes it into gitops/"
+  value       = local.registry
 }
 
-output "ecr_repositories" {
-  description = "Image repositories, one per Kubernetes service"
-  value       = { for k, r in aws_ecr_repository.svc : k => r.repository_url }
+output "kafka_bootstrap" {
+  value = local.kafka_bootstrap
 }
 
-output "ecr_registry" {
-  description = "ECR registry host; replace ACCOUNT_ID in gitops/ with the account part"
-  value       = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.region}.amazonaws.com"
-}
-
-output "msk_bootstrap_brokers" {
-  value = aws_msk_cluster.main.bootstrap_brokers
-}
-
-output "kafka_topics_expected" {
-  value = local.kafka_topics
+output "confluent_cluster_id" {
+  value = confluent_kafka_cluster.main.id
 }
 
 output "artifacts_bucket" {
-  description = "Upload the Flink jar to s3://<this>/artifacts/security-analytics.jar"
-  value       = aws_s3_bucket.artifacts.id
+  description = "Upload the Flink jar to gs://<this>/artifacts/security-analytics.jar"
+  value       = google_storage_bucket.artifacts.name
 }
 
-output "raw_bucket_name" {
-  value = module.core_data.raw_bucket_name
+output "raw_bucket" {
+  value = google_storage_bucket.raw.name
 }
 
 output "dynamodb_tables" {
@@ -41,31 +33,32 @@ output "dynamodb_tables" {
   }
 }
 
-output "rds_endpoint" {
-  value = module.core_data.rds_endpoint
+output "cloudsql_private_ip" {
+  value = google_sql_database_instance.incidents.private_ip_address
 }
 
-output "rds_secret_arn" {
-  value = module.core_data.rds_master_secret_arn
+output "normalizer_function" {
+  value = google_cloudfunctions2_function.normalizer.name
 }
 
-output "normalizer_lambda" {
-  value = aws_lambda_function.normalizer.function_name
+output "dataproc_cluster" {
+  value = google_dataproc_cluster.flink.name
 }
 
-output "emr_cluster_id" {
-  value = aws_emr_cluster.flink.id
+output "flink_submit_command" {
+  value = "gcloud dataproc jobs submit flink --cluster=${google_dataproc_cluster.flink.name} --region=${var.gcp_region} --jar=gs://${google_storage_bucket.artifacts.name}/artifacts/security-analytics.jar"
 }
 
-output "argocd_admin_password_command" {
-  description = "Run in AWS CloudShell (kubectl preinstalled) or any shell with kubectl"
-  value       = "kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
-}
-
-output "load_balancer_hostnames" {
-  description = "Public hostnames of the argocd / grafana / log-ingestion Services"
+output "load_balancer_ips" {
+  description = "Public IPs of the argocd / grafana Services (log-ingestion and the query API appear in the ArgoCD UI)"
   value = {
-    argocd  = try(data.kubernetes_service.argocd.status[0].load_balancer[0].ingress[0].hostname, "pending - re-run terraform apply")
-    grafana = try(data.kubernetes_service.grafana.status[0].load_balancer[0].ingress[0].hostname, "pending - re-run terraform apply")
+    argocd  = try(data.kubernetes_service.argocd.status[0].load_balancer[0].ingress[0].ip, "pending - re-run terraform apply")
+    grafana = try(data.kubernetes_service.grafana.status[0].load_balancer[0].ingress[0].ip, "pending - re-run terraform apply")
   }
+}
+
+output "ci_service_account_key" {
+  description = "Paste into the GitHub secret GCP_SA_KEY: terraform output -raw ci_service_account_key | base64 -d"
+  value       = google_service_account_key.ci.private_key
+  sensitive   = true
 }

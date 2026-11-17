@@ -17,6 +17,14 @@ export function loadConfig() {
     awsRegion: envStr('AWS_REGION', 'ap-south-1'),
     dynamodbEndpoint: envStr('DYNAMODB_ENDPOINT', undefined),
     s3Endpoint: envStr('S3_ENDPOINT', undefined),
+    // Object store on another provider (GCS interop): its own region and HMAC keys.
+    // Unset = same region and credentials as DynamoDB.
+    s3Region: envStr('S3_REGION', undefined),
+    // Create the bucket at startup when an endpoint is set (local emulator).
+    // Set to false when the endpoint is a real store whose bucket Terraform owns.
+    s3CreateBucket: envStr('S3_CREATE_BUCKET', 'true') !== 'false',
+    s3AccessKeyId: envStr('S3_ACCESS_KEY_ID', undefined),
+    s3SecretAccessKey: envStr('S3_SECRET_ACCESS_KEY', undefined),
     rawBucket: envStr('RAW_BUCKET', 'cs-raw-events'),
     tablePrefix: envStr('TABLE_PREFIX', 'cs-'),
     // Per-attempt deadline and attempts for every DynamoDB/S3 call; keep

@@ -4,7 +4,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.full.yml up -d --build
 #   scripts/e2e-local.sh          # sends events, waits for the incident
 #
-# log-ingestion :3000 -> raw-events -> normalizer (Lambda handler, local runner)
+# log-ingestion :3000 -> raw-events -> normalizer (function handler, local runner)
 #   -> normalized-events -> detection-rules -> security-alerts -> correlation-engine
 #   -> (gRPC) incident-management <-3PC-> event-store ; investigation-query-api :8084 reads both.
 services:
@@ -44,7 +44,7 @@ services:
       retries: 20
 
   event-normalizer:
-    # The Lambda handler, driven by a local Kafka consumer instead of the MSK trigger.
+    # The normalizer handler, driven by a local Kafka consumer instead of the Confluent connector.
     image: node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a
     working_dir: /app
     command: ["node", "scripts/local-runner.js"]

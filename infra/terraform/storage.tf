@@ -1,58 +1,107 @@
 # Storage layout (requirement g: three distinct products):
-#   S3        - raw-events archive              (module core-data, Event Store)
-#   DynamoDB  - events / correlations / 3PC log (module core-data, Event Store)
-#   RDS PG    - incidents + 3PC coordinator log (module core-data, Incident Management)
-# The data layer is Rishit's Terraform, consumed here as a module. This file also
-# creates a separate bucket for platform artifacts (Flink jar, checkpoints, EMR logs).
+#   Cloud Storage  - raw-events archive (Event Store), Flink jar/checkpoints, function source
+#   Cloud SQL PG   - incidents + 3PC coordinator log (Incident Management)
+#   DynamoDB (AWS) - events / correlations / 3PC participant log (Event Store), see dynamodb.tf
 
-resource "random_id" "suffix" {
-  byte_length = 3
-}
+# ---------------------------------------------------------------- Cloud Storage
+resource "google_storage_bucket" "raw" {
+  name                        = "${local.name}-raw-${random_id.suffix.hex}"
+  location                    = var.gcp_region
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  force_destroy               = true
 
-module "core_data" {
-  source = "./modules/core-data"
-
-  name_prefix                = "cs-" # must equal TABLE_PREFIX in the event-store
-  vpc_id                     = module.vpc.vpc_id
-  db_subnet_ids              = module.vpc.private_subnets
-  allowed_security_group_ids = [module.eks.node_security_group_id]
-  raw_bucket_name            = "${local.name}-raw-${random_id.suffix.hex}"
-}
-
-# ---------------------------------------------------------------- artifacts bucket
-resource "aws_s3_bucket" "artifacts" {
-  bucket        = "${local.name}-artifacts-${random_id.suffix.hex}"
-  force_destroy = true
-}
-
-resource "aws_s3_bucket_public_access_block" "artifacts" {
-  bucket                  = aws_s3_bucket.artifacts.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
-  bucket = aws_s3_bucket.artifacts.id
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+  lifecycle_rule {
+    condition {
+      age            = 30
+      matches_prefix = ["raw/"]
+    }
+    action {
+      type = "Delete"
     }
   }
+
+  depends_on = [google_project_service.apis]
 }
 
-resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
-  bucket = aws_s3_bucket.artifacts.id
+resource "google_storage_bucket" "artifacts" {
+  name                        = "${local.name}-artifacts-${random_id.suffix.hex}"
+  location                    = var.gcp_region
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  force_destroy               = true
 
-  rule {
-    id     = "expire-checkpoints-and-logs"
-    status = "Enabled"
-    filter {
-      prefix = "flink-checkpoints/"
+  lifecycle_rule {
+    condition {
+      age            = 7
+      matches_prefix = ["flink-checkpoints/"]
     }
-    expiration {
-      days = 7
+    action {
+      type = "Delete"
     }
   }
+
+  depends_on = [google_project_service.apis]
+}
+
+# The Event Store writes the archive through the S3-compatible XML API of Cloud
+# Storage, with an HMAC key owned by this service account.
+resource "google_service_account" "event_store_gcs" {
+  account_id   = "${local.name}-event-store-gcs"
+  display_name = "Event Store raw archive writer"
+}
+
+resource "google_storage_bucket_iam_member" "event_store_raw" {
+  bucket = google_storage_bucket.raw.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.event_store_gcs.email}"
+}
+
+resource "google_storage_hmac_key" "event_store" {
+  service_account_email = google_service_account.event_store_gcs.email
+}
+
+# ---------------------------------------------------------------- Cloud SQL (PostgreSQL 16)
+resource "random_password" "db" {
+  length  = 24
+  special = false
+}
+
+resource "google_sql_database_instance" "incidents" {
+  name             = "${local.name}-incidents-${random_id.suffix.hex}"
+  database_version = "POSTGRES_16"
+  region           = var.gcp_region
+
+  deletion_protection = false
+
+  settings {
+    tier              = var.cloudsql_tier
+    edition           = "ENTERPRISE"
+    availability_type = "ZONAL"
+    disk_size         = 20
+    disk_type         = "PD_SSD"
+
+    ip_configuration {
+      # Private IP only: reachable from GKE inside the VPC, never from the internet.
+      ipv4_enabled    = false
+      private_network = google_compute_network.main.id
+    }
+
+    backup_configuration {
+      enabled = true
+    }
+  }
+
+  depends_on = [google_service_networking_connection.private_services]
+}
+
+resource "google_sql_database" "incidents" {
+  name     = "incidents"
+  instance = google_sql_database_instance.incidents.name
+}
+
+resource "google_sql_user" "incidents" {
+  name     = "incidents"
+  instance = google_sql_database_instance.incidents.name
+  password = random_password.db.result
 }

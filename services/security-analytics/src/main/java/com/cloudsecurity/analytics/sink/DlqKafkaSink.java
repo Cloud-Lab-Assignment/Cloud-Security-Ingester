@@ -20,6 +20,7 @@ public final class DlqKafkaSink {
     public static KafkaSink<KafkaInputRecord> create() {
         return KafkaSink.<KafkaInputRecord>builder()
                 .setBootstrapServers(AnalyticsConfig.BOOTSTRAP_SERVERS)
+                .setKafkaProducerConfig(AnalyticsConfig.kafkaSecurityProperties())
                 .setRecordSerializer(
                         new KafkaRecordSerializationSchema<KafkaInputRecord>() {
                             @Override

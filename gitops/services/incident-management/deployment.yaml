@@ -15,12 +15,13 @@ spec:
     spec:
       containers:
         - name: incident-management
-          image: ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/cloud-sec/incident-management:latest
+          image: asia-south1-docker.pkg.dev/PROJECT_ID/cloud-sec/incident-management:latest
           ports:
             - {name: http, containerPort: 8082}
             - {name: grpc, containerPort: 50051}
           envFrom:
             - configMapRef: {name: infra-endpoints}
+            - secretRef: {name: kafka-credentials}
             - secretRef: {name: incident-db}
           env:
             - {name: NODE_ENV, value: production}

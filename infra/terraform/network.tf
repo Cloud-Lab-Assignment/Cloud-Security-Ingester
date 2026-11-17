@@ -1,86 +1,96 @@
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 5.8"
+# APIs the project needs. Enabling is idempotent; nothing is disabled on destroy.
+resource "google_project_service" "apis" {
+  for_each = toset([
+    "compute.googleapis.com",
+    "container.googleapis.com",
+    "dataproc.googleapis.com",
+    "sqladmin.googleapis.com",
+    "servicenetworking.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "cloudfunctions.googleapis.com",
+    "run.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "storage.googleapis.com",
+    "iam.googleapis.com",
+  ])
 
-  name = local.name
-  cidr = var.vpc_cidr
-  azs  = local.azs
+  service            = each.key
+  disable_on_destroy = false
+}
 
-  private_subnets = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 4, i)]
-  public_subnets  = [for i, _ in local.azs : cidrsubnet(var.vpc_cidr, 8, 200 + i)]
+resource "google_compute_network" "main" {
+  name                    = local.name
+  auto_create_subnetworks = false
 
-  enable_nat_gateway   = true
-  single_nat_gateway   = true # cost saving for a course project
-  enable_dns_hostnames = true
-  enable_dns_support   = true
+  depends_on = [google_project_service.apis]
+}
 
-  public_subnet_tags = {
-    "kubernetes.io/role/elb" = 1
+resource "google_compute_subnetwork" "main" {
+  name                     = "${local.name}-${var.gcp_region}"
+  region                   = var.gcp_region
+  network                  = google_compute_network.main.id
+  ip_cidr_range            = "10.30.0.0/20"
+  private_ip_google_access = true
+
+  # VPC-native GKE: pods and services get their own ranges.
+  secondary_ip_range {
+    range_name    = "pods"
+    ip_cidr_range = "10.32.0.0/14"
   }
-  private_subnet_tags = {
-    "kubernetes.io/role/internal-elb" = 1
-  }
-}
-
-# Free gateway endpoints keep S3 / DynamoDB traffic off the NAT.
-resource "aws_vpc_endpoint" "s3" {
-  vpc_id            = module.vpc.vpc_id
-  service_name      = "com.amazonaws.${var.region}.s3"
-  vpc_endpoint_type = "Gateway"
-  route_table_ids   = module.vpc.private_route_table_ids
-}
-
-resource "aws_vpc_endpoint" "dynamodb" {
-  vpc_id            = module.vpc.vpc_id
-  service_name      = "com.amazonaws.${var.region}.dynamodb"
-  vpc_endpoint_type = "Gateway"
-  route_table_ids   = module.vpc.private_route_table_ids
-}
-
-# ---------- Security groups ----------
-resource "aws_security_group" "msk" {
-  name_prefix = "${local.name}-msk-"
-  vpc_id      = module.vpc.vpc_id
-  description = "MSK brokers"
-
-  lifecycle {
-    create_before_destroy = true
+  secondary_ip_range {
+    range_name    = "services"
+    ip_cidr_range = "10.36.0.0/20"
   }
 }
 
-resource "aws_security_group_rule" "msk_from_vpc" {
-  type              = "ingress"
-  security_group_id = aws_security_group.msk.id
-  from_port         = 9092
-  to_port           = 9098
-  protocol          = "tcp"
-  cidr_blocks       = [var.vpc_cidr]
-  description       = "Kafka (plaintext 9092, TLS 9094, SCRAM 9096) from inside the VPC"
+# A custom VPC has no default rules. Dataproc nodes must reach each other, and
+# GKE pods must reach Cloud SQL / each other across nodes.
+resource "google_compute_firewall" "internal" {
+  name    = "${local.name}-allow-internal"
+  network = google_compute_network.main.id
+
+  allow {
+    protocol = "tcp"
+  }
+  allow {
+    protocol = "udp"
+  }
+  allow {
+    protocol = "icmp"
+  }
+
+  source_ranges = ["10.30.0.0/20", "10.32.0.0/14", "10.36.0.0/20"]
 }
 
-resource "aws_security_group" "lambda" {
-  name_prefix = "${local.name}-lambda-"
-  vpc_id      = module.vpc.vpc_id
-  description = "event-normalizer Lambda"
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  lifecycle {
-    create_before_destroy = true
-  }
+# Private services access: gives Cloud SQL a private IP inside this VPC.
+resource "google_compute_global_address" "private_services" {
+  name          = "${local.name}-private-services"
+  purpose       = "VPC_PEERING"
+  address_type  = "INTERNAL"
+  prefix_length = 20
+  network       = google_compute_network.main.id
 }
 
-resource "aws_security_group" "emr_extra" {
-  name_prefix = "${local.name}-emr-"
-  vpc_id      = module.vpc.vpc_id
-  description = "EMR Flink cluster (additional rules; EMR manages its own master/slave SGs)"
+resource "google_service_networking_connection" "private_services" {
+  network                 = google_compute_network.main.id
+  service                 = "servicenetworking.googleapis.com"
+  reserved_peering_ranges = [google_compute_global_address.private_services.name]
 
-  lifecycle {
-    create_before_destroy = true
-  }
+  depends_on = [google_project_service.apis]
+}
+
+# Cloud NAT: Dataproc nodes have internal IPs only (default from image 2.2),
+# and need outbound internet to reach Confluent Cloud.
+resource "google_compute_router" "main" {
+  name    = "${local.name}-router"
+  region  = var.gcp_region
+  network = google_compute_network.main.id
+}
+
+resource "google_compute_router_nat" "main" {
+  name                               = "${local.name}-nat"
+  router                             = google_compute_router.main.name
+  region                             = var.gcp_region
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
 }

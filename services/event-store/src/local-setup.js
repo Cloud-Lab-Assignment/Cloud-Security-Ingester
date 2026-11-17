@@ -74,5 +74,7 @@ async function ensureBucket({ s3, bucket, logger }) {
 // In AWS both endpoints are unset and Terraform owns these resources.
 export async function ensureLocalResources({ config, ddb, s3, logger }) {
   if (config.dynamodbEndpoint && ddb) await ensureTables({ ddb, tablePrefix: config.tablePrefix, logger });
-  if (config.s3Endpoint && s3) await ensureBucket({ s3, bucket: config.rawBucket, logger });
+  if (config.s3Endpoint && config.s3CreateBucket !== false && s3) {
+    await ensureBucket({ s3, bucket: config.rawBucket, logger });
+  }
 }

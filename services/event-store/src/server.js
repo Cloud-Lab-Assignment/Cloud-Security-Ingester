@@ -18,7 +18,15 @@ async function main() {
 
   const deadlines = { requestTimeoutMs: config.awsRequestTimeoutMs, maxAttempts: config.awsMaxAttempts };
   const { ddb, doc } = createDynamoClients({ region: config.awsRegion, endpoint: config.dynamodbEndpoint, ...deadlines });
-  const s3 = createS3Client({ region: config.awsRegion, endpoint: config.s3Endpoint, ...deadlines });
+  const s3 = createS3Client({
+    region: config.s3Region ?? config.awsRegion,
+    endpoint: config.s3Endpoint,
+    credentials:
+      config.s3AccessKeyId && config.s3SecretAccessKey
+        ? { accessKeyId: config.s3AccessKeyId, secretAccessKey: config.s3SecretAccessKey }
+        : undefined,
+    ...deadlines,
+  });
   const repo = createDynamoRepo({ doc, tablePrefix: config.tablePrefix });
   const archive = createS3Archive({ s3, bucket: config.rawBucket });
   const participant = createCorrelationParticipant({

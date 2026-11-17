@@ -55,8 +55,10 @@ public class NormalizedEvent {
         }
 
         Object value = map.get(field);
-        return value instanceof String text && !text.isBlank()
-                ? text
-                : null;
+        // No pattern matching: the job targets Java 11 (Dataproc's Flink runtime).
+        if (value instanceof String && !((String) value).isBlank()) {
+            return (String) value;
+        }
+        return null;
     }
 }

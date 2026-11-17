@@ -4,12 +4,24 @@ import { awsClientOptions } from './aws-options.js';
 
 const SAFE_ID = /^[A-Za-z0-9._-]+$/;
 
-// A custom endpoint (MinIO or another emulator) needs path-style addressing.
-export function createS3Client({ region, endpoint, requestTimeoutMs, maxAttempts }) {
+// A custom endpoint (an emulator, or Google Cloud Storage's S3-compatible XML
+// API at https://storage.googleapis.com) needs path-style addressing. Such an
+// endpoint may also need its own credentials (GCS HMAC keys) while DynamoDB
+// keeps the AWS ones, and must not get the SDK's newer default checksums,
+// which S3-compatible stores commonly reject.
+export function createS3Client({ region, endpoint, credentials, requestTimeoutMs, maxAttempts }) {
   return new S3Client({
     region,
     ...awsClientOptions({ requestTimeoutMs, maxAttempts }),
-    ...(endpoint ? { endpoint, forcePathStyle: true } : {}),
+    ...(endpoint
+      ? {
+          endpoint,
+          forcePathStyle: true,
+          requestChecksumCalculation: 'WHEN_REQUIRED',
+          responseChecksumValidation: 'WHEN_REQUIRED',
+        }
+      : {}),
+    ...(credentials ? { credentials } : {}),
   });
 }
 

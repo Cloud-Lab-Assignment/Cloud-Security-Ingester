@@ -8,6 +8,6 @@ resources:
   - hpa.yaml
 images:
   # CI (.github/workflows/ci.yml) bumps newTag in a Git commit -> ArgoCD syncs.
-  # ACCOUNT_ID is replaced by scripts/set-account-id.sh.
-  - name: ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/cloud-sec/correlation-engine
+  # PROJECT_ID is replaced by scripts/set-registry.sh.
+  - name: asia-south1-docker.pkg.dev/PROJECT_ID/cloud-sec/correlation-engine
     newTag: latest

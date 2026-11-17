@@ -1,9 +1,22 @@
 import { Kafka, logLevel } from 'kafkajs';
 import { env } from '../config/env.js';
 
+// Same connection variables as the other services: KAFKA_SSL ("true" enables TLS),
+// KAFKA_USERNAME / KAFKA_PASSWORD (SASL, e.g. a Confluent Cloud API key),
+// KAFKA_SASL_MECHANISM (default "plain").
+const sasl = process.env.KAFKA_USERNAME && process.env.KAFKA_PASSWORD
+  ? {
+      mechanism: (process.env.KAFKA_SASL_MECHANISM ?? 'plain').toLowerCase(),
+      username: process.env.KAFKA_USERNAME,
+      password: process.env.KAFKA_PASSWORD
+    }
+  : undefined;
+
 const kafka = new Kafka({
   clientId: env.KAFKA_CLIENT_ID,
   brokers: env.KAFKA_BROKERS,
+  ssl: process.env.KAFKA_SSL === 'true',
+  ...(sasl ? { sasl } : {}),
   logLevel: logLevel.ERROR,
   retry: {
     retries: env.KAFKA_PRODUCER_RETRIES,

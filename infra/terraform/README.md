@@ -1,18 +1,18 @@
 # Terraform
 
-Root module = platform; `modules/core-data` = data layer for the core services (Rishit).
+Three providers: **Google Cloud** (most of the system), **Confluent Cloud** (Kafka) and **AWS** (only DynamoDB).
 
 | File | What |
 |---|---|
-| `network.tf` | VPC, NAT, S3/DynamoDB gateway endpoints, MSK + Lambda + EMR security groups |
-| `eks.tf` | EKS, event-store IRSA, namespace, `infra-endpoints` ConfigMap, `incident-db` Secret |
-| `storage.tf` | calls `modules/core-data` (DynamoDB x3, S3 raw bucket, RDS PostgreSQL) + artifacts bucket |
-| `msk.tf` | Managed Kafka |
-| `lambda.tf` | event-normalizer Lambda + MSK event-source mapping |
-| `emr.tf` | EMR cluster with Flink, job submission step |
-| `ecr.tf` | one image repository per Kubernetes service |
-| `helm.tf` | ArgoCD (+ root app-of-apps), kube-prometheus-stack, Loki |
-| `outputs.tf` | endpoints and hostnames |
+| `network.tf` | APIs, VPC + subnet (with GKE pod/service ranges), firewall, Cloud NAT, private services access for Cloud SQL |
+| `gke.tf` | Artifact Registry, GKE cluster + autoscaling node pool, `cloud-sec` namespace, `infra-endpoints` ConfigMap, Secrets (`kafka-credentials`, `incident-db`, `event-store-cloud`), CI service account |
+| `confluent.tf` | Confluent environment, Basic Kafka cluster on GCP, service account + API key, 7 topics, the managed connector that triggers the function |
+| `function.tf` | event-normalizer Cloud Run function (2nd gen), Secret Manager secret, invoker identity for the connector |
+| `dataproc.tf` | Dataproc cluster with the Flink component, Kafka settings passed to the job's containers |
+| `storage.tf` | Cloud Storage buckets (raw archive, artifacts), HMAC key for the Event Store, Cloud SQL PostgreSQL 16 |
+| `dynamodb.tf` | calls `modules/core-data` (DynamoDB tables), IAM user + access key for the Event Store |
+| `helm.tf` | Argo CD (+ root app-of-apps), kube-prometheus-stack, Loki |
+| `outputs.tf` | endpoints, IPs, the Flink submit command, the CI key |
 
-Apply order and everything else: [docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md). The module's own notes: [modules/core-data/README.md](modules/core-data/README.md).
-`terraform validate` passes (Terraform 1.9, via Docker); nothing has been applied to AWS yet.
+Apply order and everything else: [docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md).
+`terraform validate` passes (Terraform 1.9, google 6.50, confluent 2.95, aws 5.100); nothing has been applied yet.

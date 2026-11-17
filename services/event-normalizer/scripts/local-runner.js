@@ -1,6 +1,7 @@
-// Local stand-in for the AWS Lambda MSK trigger (docker-compose.full.yml only).
-// Consumes raw-events and invokes the real Lambda handler with the same event
-// shape the MSK event source mapping delivers. Not packaged into the Lambda zip.
+// Local stand-in for the cloud trigger (docker-compose.full.yml only).
+// Consumes raw-events and invokes the normalizer handler with the Kafka event
+// shape it expects (the same shape src/gcf.js builds from the Confluent
+// connector's HTTP request). Not packaged into the function source.
 import { Kafka, logLevel } from 'kafkajs';
 import { handler } from '../src/handler.js';
 

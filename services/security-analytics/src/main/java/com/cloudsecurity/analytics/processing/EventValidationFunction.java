@@ -206,11 +206,11 @@ public class EventValidationFunction
         Object type = source.get("type");
         Object name = source.get("name");
 
-        if (!(type instanceof String typeText) || !isValidName(typeText)) {
+        if (!(type instanceof String) || !isValidName((String) type)) {
             return "Invalid source.type";
         }
 
-        if (!(name instanceof String nameText) || nameText.isBlank()) {
+        if (!(name instanceof String) || ((String) name).isBlank()) {
             return "Invalid source.name";
         }
 
@@ -230,7 +230,7 @@ public class EventValidationFunction
 
         Object topic = origin.get("topic");
 
-        if (!(topic instanceof String topicText) || topicText.isBlank()) {
+        if (!(topic instanceof String) || ((String) topic).isBlank()) {
             return "Invalid origin.topic";
         }
 
@@ -247,11 +247,11 @@ public class EventValidationFunction
         Object name = service.get("name");
         Object version = service.get("version");
 
-        if (!(name instanceof String nameText) || nameText.isBlank()) {
+        if (!(name instanceof String) || ((String) name).isBlank()) {
             return "Invalid " + field + ".name";
         }
 
-        if (!(version instanceof String versionText) || versionText.isBlank()) {
+        if (!(version instanceof String) || ((String) version).isBlank()) {
             return "Invalid " + field + ".version";
         }
 

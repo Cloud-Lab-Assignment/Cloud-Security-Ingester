@@ -12,14 +12,15 @@ spec:
     metadata:
       labels: {app: event-store}
     spec:
-      serviceAccountName: event-store
       containers:
         - name: event-store
-          image: ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/cloud-sec/event-store:latest
+          image: asia-south1-docker.pkg.dev/PROJECT_ID/cloud-sec/event-store:latest
           ports:
             - {name: http, containerPort: 8081}
           envFrom:
             - configMapRef: {name: infra-endpoints}
+            - secretRef: {name: kafka-credentials}
+            - secretRef: {name: event-store-cloud}   # DynamoDB access key + Cloud Storage HMAC key
           env:
             - {name: NODE_ENV, value: production}
           readinessProbe:

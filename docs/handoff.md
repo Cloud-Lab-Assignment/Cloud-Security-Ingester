@@ -1,6 +1,6 @@
 # Core services handoff: event-store, incident-management, correlation-engine
 
-> Ports, env vars, topics and AWS resources are final. Image names and the registry are still to be agreed with Ansh.
+> Ports, env vars and topics are final. **Deployment target changed after this was written:** the services run on GKE with Kafka on Confluent Cloud, Cloud SQL instead of RDS, Cloud Storage (S3-compatible API) instead of S3, and DynamoDB still on AWS. The current wiring is in [DEPLOYMENT.md](DEPLOYMENT.md) and `infra/terraform/gke.tf`.
 
 For **Ansh** (CI/CD, K8s, GitOps) and **Neeharika** (Kafka/infra). Owner of these services: Rishit.
 

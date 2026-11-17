@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: investigation-query-api
-          image: ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/cloud-sec/investigation-query-api:latest
+          image: asia-south1-docker.pkg.dev/PROJECT_ID/cloud-sec/investigation-query-api:latest
           ports:
             - {name: http, containerPort: 8084}
           envFrom:

@@ -7,7 +7,8 @@ confirm Aaditya's and Neeharika's exact assignments with them.
 ID number        | Name        | Tasks
 -----------------+-------------+--------------------------------------------------------------------
 TODO             | Ansh        | Platform and delivery:
-                 |             |  - Terraform root (VPC, EKS, ECR, MSK, Lambda, EMR/Flink, Helm add-ons)
+                 |             |  - Terraform (GCP: VPC, GKE, Artifact Registry, Dataproc, Cloud Run function,
+                 |             |    Cloud SQL, Cloud Storage; Confluent Cloud; AWS DynamoDB; Helm add-ons)
                  |             |  - GitOps: ArgoCD app-of-apps, Kustomize manifests, HPAs (requirements c, d)
                  |             |  - CI workflow (build/push images, bump tags), Dockerfiles for upstream services
                  |             |  - Observability: Prometheus, Grafana dashboard, Loki/Promtail (requirement h)
@@ -18,6 +19,6 @@ TODO             | Rishit      | Services: Correlation Engine, Incident Manageme
                  |             |  - 3PC concept implementation (requirement f)
                  |             |  - Three storage products: S3, DynamoDB, RDS PostgreSQL (requirement g)
                  |             |  - Terraform module infra/terraform/modules/core-data
-TODO             | Aaditya     | Services: Log Ingestion, Event Normalizer (Lambda), Detection Rules,
+TODO             | Aaditya     | Services: Log Ingestion, Event Normalizer (serverless function), Detection Rules,
                  |             | Security Analytics (Flink job, requirement e)
 TODO             | Neeharika   | Kafka / messaging infrastructure, topics and ACLs (per docs/handoff.md)

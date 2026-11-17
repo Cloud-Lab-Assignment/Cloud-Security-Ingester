@@ -1,87 +1,83 @@
-variable "region" {
-  description = "AWS region"
-  type        = string
-  default     = "ap-south-1"
-}
-
 variable "project" {
   description = "Name prefix for all resources"
   type        = string
   default     = "cloud-sec"
 }
 
-variable "environment" {
+# ---------- Google Cloud ----------
+variable "gcp_project_id" {
+  description = "Google Cloud project ID (billing must be enabled)"
+  type        = string
+}
+
+variable "gcp_region" {
+  description = "Region for GKE, Dataproc, Cloud SQL, the function and the Confluent cluster"
+  type        = string
+  default     = "asia-south1"
+}
+
+variable "gcp_zone" {
+  description = "Zone for the (zonal) GKE cluster and Dataproc"
+  type        = string
+  default     = "asia-south1-a"
+}
+
+variable "gke_machine_type" {
   type    = string
-  default = "dev"
+  default = "e2-standard-4"
 }
 
-variable "vpc_cidr" {
-  type    = string
-  default = "10.20.0.0/16"
-}
-
-variable "az_count" {
-  description = "Number of AZs (MSK needs >= 2; 3 recommended)"
-  type        = number
-  default     = 3
-}
-
-# ---------- EKS ----------
-variable "eks_version" {
-  type    = string
-  default = "1.30"
-}
-
-variable "eks_node_instance_types" {
-  type    = list(string)
-  default = ["t3.large"]
-}
-
-variable "eks_node_min" {
+variable "gke_node_min" {
   type    = number
   default = 2
 }
 
-variable "eks_node_max" {
+variable "gke_node_max" {
   description = "Max nodes; must leave room for HPA scale-out during the load test"
   type        = number
-  default     = 6
+  default     = 5
 }
 
-variable "eks_node_desired" {
-  type    = number
-  default = 3
-}
-
-# ---------- MSK ----------
-variable "msk_kafka_version" {
+variable "cloudsql_tier" {
   type    = string
-  default = "3.6.0"
+  default = "db-custom-1-3840"
 }
 
-variable "msk_instance_type" {
-  type    = string
-  default = "kafka.t3.small"
-}
-
-# ---------- EMR / Flink ----------
-variable "emr_release_label" {
-  description = "EMR release that ships Flink 1.20 (matches services/security-analytics/pom.xml)"
+variable "dataproc_image_version" {
+  description = "Dataproc image; 2.2 ships Flink 1.17.0 on Java 11 (matches services/security-analytics/pom.xml)"
   type        = string
-  default     = "emr-7.5.0"
+  default     = "2.2-debian12"
 }
 
-variable "emr_instance_type" {
+variable "dataproc_machine_type" {
   type    = string
-  default = "m5.xlarge"
+  default = "e2-standard-4"
 }
 
-variable "emr_core_count" {
+variable "dataproc_workers" {
   type    = number
   default = 2
 }
 
-# ---------- GitOps ----------
+# ---------- Confluent Cloud ----------
+variable "confluent_cloud_api_key" {
+  description = "Confluent Cloud API key (Cloud resource management scope)"
+  type        = string
+  sensitive   = true
+}
+
+variable "confluent_cloud_api_secret" {
+  type      = string
+  sensitive = true
+}
+
+# ---------- AWS (DynamoDB only) ----------
+variable "aws_region" {
+  type    = string
+  default = "ap-south-1"
+}
+
+# ---------- GitOps / add-ons ----------
 variable "gitops_repo_url" {
   type    = string
   default = "https://github.com/ashkew2202/Cloud-Security-Ingester.git"
@@ -112,12 +108,10 @@ variable "grafana_admin_password" {
 }
 
 locals {
-  name = "${var.project}-${var.environment}"
+  name = var.project
 
-  azs = slice(data.aws_availability_zones.available.names, 0, var.az_count)
-
-  # Microservices that run as containers on EKS (the other two: event-normalizer = Lambda,
-  # security-analytics = Flink on EMR).
+  # Microservices that run as containers on GKE (the other two: event-normalizer =
+  # Cloud Run function, security-analytics = Flink on Dataproc).
   k8s_services = [
     "log-ingestion",
     "detection-rules",
@@ -137,15 +131,12 @@ locals {
     "results",
   ]
 
-  tags = {
-    Project     = var.project
-    Environment = var.environment
-    ManagedBy   = "terraform"
-  }
+  # "SASL_SSL://pkc-xxxxx.asia-south1.gcp.confluent.cloud:9092" -> "pkc-...:9092"
+  kafka_bootstrap = replace(confluent_kafka_cluster.main.bootstrap_endpoint, "SASL_SSL://", "")
+
+  registry = "${var.gcp_region}-docker.pkg.dev/${var.gcp_project_id}/${google_artifact_registry_repository.images.repository_id}"
 }
 
-data "aws_availability_zones" "available" {
-  state = "available"
+resource "random_id" "suffix" {
+  byte_length = 3
 }
-
-data "aws_caller_identity" "current" {}

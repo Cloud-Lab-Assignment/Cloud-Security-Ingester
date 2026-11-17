@@ -1,5 +1,6 @@
-# Data access for the event-store pods. Attach to the event-store IRSA / pod role.
-# incident-management needs no DynamoDB or S3 access (it reaches the Event Store over REST).
+# Data access for the event-store. The pods run on GKE, so the root module
+# attaches this policy to an IAM user whose access key is stored in a K8s Secret.
+# The raw-events archive lives in Google Cloud Storage and is not covered here.
 
 data "aws_iam_policy_document" "data_access" {
   statement {
@@ -19,22 +20,10 @@ data "aws_iam_policy_document" "data_access" {
       aws_dynamodb_table.tpc.arn,
     ]
   }
-
-  statement {
-    sid       = "RawArchiveObjects"
-    actions   = ["s3:PutObject", "s3:GetObject"]
-    resources = ["${aws_s3_bucket.raw.arn}/raw/*"]
-  }
-
-  statement {
-    sid       = "RawArchiveBucket"
-    actions   = ["s3:ListBucket"]
-    resources = [aws_s3_bucket.raw.arn]
-  }
 }
 
 resource "aws_iam_policy" "data_access" {
   name        = "${var.name_prefix}core-services-data-access"
-  description = "Event Store access to its DynamoDB tables and the raw-events S3 archive"
+  description = "Event Store access to its DynamoDB tables"
   policy      = data.aws_iam_policy_document.data_access.json
 }

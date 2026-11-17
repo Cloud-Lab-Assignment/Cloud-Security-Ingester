@@ -1,7 +1,15 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.6"
 
   required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 6.10"
+    }
+    confluent = {
+      source  = "confluentinc/confluent"
+      version = "~> 2.10"
+    }
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.60"
@@ -24,45 +32,52 @@ terraform {
     }
   }
 
-  # Uncomment after creating a state bucket + lock table by hand (or via bootstrap).
-  # backend "s3" {
-  #   bucket         = "<your-tfstate-bucket>"
-  #   key            = "cloud-security-ingester/terraform.tfstate"
-  #   region         = "ap-south-1"
-  #   dynamodb_table = "<your-tflock-table>"
-  #   encrypt        = true
+  # Optional remote state (create the bucket first):
+  # backend "gcs" {
+  #   bucket = "<your-tfstate-bucket>"
+  #   prefix = "cloud-security-ingester"
   # }
 }
 
+# --- Google Cloud: GKE, Dataproc, Cloud Run function, Cloud SQL, Cloud Storage, Artifact Registry
+# Credentials: `gcloud auth application-default login`
+provider "google" {
+  project = var.gcp_project_id
+  region  = var.gcp_region
+}
+
+# --- Confluent Cloud: Kafka cluster, topics, the connector that triggers the function
+# Credentials: a Cloud API key (not a cluster key) from Confluent Cloud > API keys
+provider "confluent" {
+  cloud_api_key    = var.confluent_cloud_api_key
+  cloud_api_secret = var.confluent_cloud_api_secret
+}
+
+# --- AWS: only the Event Store's DynamoDB tables
+# Credentials: `aws configure` or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
 provider "aws" {
-  region = var.region
+  region = var.aws_region
 
   default_tags {
-    tags = local.tags
+    tags = {
+      Project   = var.project
+      ManagedBy = "terraform"
+    }
   }
 }
 
-# Helm / Kubernetes providers authenticate against the EKS cluster created below.
-provider "kubernetes" {
-  host                   = module.eks.cluster_endpoint
-  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+data "google_client_config" "current" {}
 
-  exec {
-    api_version = "client.authentication.k8s.io/v1beta1"
-    command     = "aws"
-    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
-  }
+provider "kubernetes" {
+  host                   = "https://${google_container_cluster.main.endpoint}"
+  token                  = data.google_client_config.current.access_token
+  cluster_ca_certificate = base64decode(google_container_cluster.main.master_auth[0].cluster_ca_certificate)
 }
 
 provider "helm" {
   kubernetes {
-    host                   = module.eks.cluster_endpoint
-    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
-
-    exec {
-      api_version = "client.authentication.k8s.io/v1beta1"
-      command     = "aws"
-      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
-    }
+    host                   = "https://${google_container_cluster.main.endpoint}"
+    token                  = data.google_client_config.current.access_token
+    cluster_ca_certificate = base64decode(google_container_cluster.main.master_auth[0].cluster_ca_certificate)
   }
 }

@@ -33,10 +33,10 @@ resource "helm_release" "argocd" {
     ignore_changes = [set_sensitive]
   }
 
-  depends_on = [module.eks]
+  depends_on = [google_container_node_pool.main]
 }
 
-# LoadBalancer hostnames, surfaced as Terraform outputs.
+# LoadBalancer IPs (GKE assigns IPs, not hostnames), surfaced as Terraform outputs.
 data "kubernetes_service" "argocd" {
   metadata {
     name      = "argocd-server"
@@ -126,7 +126,7 @@ resource "helm_release" "kube_prometheus_stack" {
     }
   })]
 
-  depends_on = [module.eks]
+  depends_on = [google_container_node_pool.main]
 }
 
 # ---------------------------------------------------------------- Loki + Promtail (central logging)
@@ -145,5 +145,5 @@ resource "helm_release" "loki" {
     promtail = { enabled = true } # DaemonSet: ships logs of every pod on every node
   })]
 
-  depends_on = [module.eks]
+  depends_on = [google_container_node_pool.main]
 }

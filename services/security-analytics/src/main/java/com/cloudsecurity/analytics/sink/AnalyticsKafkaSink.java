@@ -54,6 +54,7 @@ public final class AnalyticsKafkaSink {
     public static KafkaSink<AnalyticsResult> create() {
         return KafkaSink.<AnalyticsResult>builder()
                 .setBootstrapServers(AnalyticsConfig.BOOTSTRAP_SERVERS)
+                .setKafkaProducerConfig(AnalyticsConfig.kafkaSecurityProperties())
                 .setRecordSerializer(
                         new KafkaRecordSerializationSchema<AnalyticsResult>() {
                             @Override

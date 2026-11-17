@@ -14,11 +14,12 @@ spec:
     spec:
       containers:
         - name: correlation-engine
-          image: ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/cloud-sec/correlation-engine:latest
+          image: asia-south1-docker.pkg.dev/PROJECT_ID/cloud-sec/correlation-engine:latest
           ports:
             - {name: http, containerPort: 8083}
           envFrom:
             - configMapRef: {name: infra-endpoints}
+            - secretRef: {name: kafka-credentials}
           env:
             - {name: NODE_ENV, value: production}
           readinessProbe:

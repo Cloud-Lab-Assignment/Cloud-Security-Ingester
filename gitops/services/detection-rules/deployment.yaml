@@ -14,9 +14,10 @@ spec:
     spec:
       containers:
         - name: detection-rules
-          image: ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/cloud-sec/detection-rules:latest
+          image: asia-south1-docker.pkg.dev/PROJECT_ID/cloud-sec/detection-rules:latest
           envFrom:
             - configMapRef: {name: infra-endpoints}
+            - secretRef: {name: kafka-credentials}
           env:
             - {name: NODE_ENV, value: production}
             - {name: INPUT_TOPIC, value: normalized-events}

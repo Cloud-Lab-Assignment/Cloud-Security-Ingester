@@ -1,154 +1,183 @@
-# Deployment guide (AWS, end to end)
+# Deployment guide (Google Cloud + Confluent Cloud + AWS DynamoDB)
 
-Everything is provisioned by Terraform and deployed by ArgoCD from Git. You never run `kubectl apply`.
-Region defaults to `ap-south-1`. Estimated cost while running: roughly US$8-12/day (EKS control plane, 3 x t3.large, 3 x MSK kafka.t3.small, 3 x EMR m5.xlarge, NAT gateway, RDS). **Destroy when done (section 9).**
+Everything is provisioned by Terraform and deployed by Argo CD from Git. You never run `kubectl apply`.
+
+- **Google Cloud** (`asia-south1`): GKE, Dataproc (Flink), the Cloud Run function, Cloud SQL, Cloud Storage, Artifact Registry.
+- **Confluent Cloud**: Kafka (Basic cluster hosted on Google Cloud, same region) and the managed connector that triggers the function.
+- **AWS** (`ap-south-1`): only the Event Store's three DynamoDB tables (on-demand, costs cents).
+
+Rough running cost: about US$6-10/day on Google Cloud (GKE nodes, Dataproc, Cloud SQL, NAT) plus Confluent Basic usage. **Destroy when done (section 9).**
 
 ## 0. What gets built
 
-| # | Service | Owner | Runs on | Talks via |
-|---|---|---|---|---|
-| 1 | log-ingestion | Aaditya | EKS (public LoadBalancer) | REST in, Kafka `raw-events` out |
-| 2 | event-normalizer | Aaditya | **Lambda** (MSK trigger) | Kafka `raw-events` -> `normalized-events` / DLQ |
-| 3 | correlation-engine | Rishit | EKS | Kafka `security-alerts` in, **gRPC** to incident-management, REST to event-store |
-| 4 | event-store | Rishit | EKS | Kafka in, REST API, 3PC participant; S3 + DynamoDB |
-| 5 | detection-rules | Aaditya | EKS | Kafka `normalized-events` -> `security-alerts` |
-| 6 | incident-management | Rishit | EKS (1 pod, no HPA) | gRPC + REST, 3PC coordinator; RDS PostgreSQL; Kafka `incident-updates` |
-| 7 | investigation-query-api | Ansh | EKS (public LoadBalancer) | REST to event-store and incident-management |
-| 8 | security-analytics | Aaditya | **Flink on EMR** | Kafka `normalized-events` -> windowed aggregation -> `results` |
+| # | Service | Runs on | Talks via |
+|---|---|---|---|
+| 1 | log-ingestion | GKE (public LoadBalancer) | REST in, Kafka `raw-events` out |
+| 2 | event-normalizer | **Cloud Run function** (triggered by Confluent's Cloud Functions Gen 2 Sink connector) | Kafka `raw-events` -> `normalized-events` / DLQ |
+| 3 | correlation-engine | GKE | Kafka `security-alerts` in, **gRPC** to incident-management, REST to event-store |
+| 4 | event-store | GKE | Kafka in, REST API, 3PC participant; Cloud Storage + DynamoDB |
+| 5 | detection-rules | GKE | Kafka `normalized-events` -> `security-alerts` |
+| 6 | incident-management | GKE (1 pod, no HPA) | gRPC + REST, 3PC coordinator; Cloud SQL PostgreSQL; Kafka `incident-updates` |
+| 7 | investigation-query-api | GKE (public LoadBalancer) | REST to event-store and incident-management |
+| 8 | security-analytics | **Flink on Dataproc** | Kafka `normalized-events` -> windowed aggregation -> `results` |
 
-Requirement map: REST + gRPC + Kafka are all used (a); one Lambda (b); HPAs on log-ingestion, detection-rules, correlation-engine, event-store (c); ArgoCD (d); Flink on EMR (e); 3PC between incident-management and event-store (f); S3 + DynamoDB + RDS (g); Prometheus, Grafana, Loki (h).
+## 1. Prerequisites
 
-## 1. Prerequisites (your laptop)
+1. **Google Cloud:** a project with billing (your credits) enabled. Install the [gcloud CLI](https://cloud.google.com/sdk/docs/install), then:
+   ```bash
+   gcloud auth login
+   gcloud auth application-default login
+   gcloud config set project <your-project-id>
+   ```
+2. **Confluent Cloud:** sign up at confluent.cloud (new accounts get free credits). Create a **Cloud resource management** API key: *Administration -> API keys -> Add key -> My account (or a service account with OrganizationAdmin) -> Cloud resource management*. Keep the key and secret.
+3. **AWS:** an account and `aws configure` with a user that can create DynamoDB tables and IAM users.
+4. Tools: Terraform >= 1.6, Docker, Node 22, git. Optional: k6 (or run it through Docker), Maven + JDK 11/17 (or build the jar through Docker as shown below).
+5. A **public** GitHub repo you can push to (Argo CD reads it anonymously).
 
-- AWS account with admin rights and an access key (`aws configure`). Install: AWS CLI v2, Terraform >= 1.6, Node 22, Maven + JDK 17, Docker, k6, git.
-- Fork/clone of the GitHub repo you will push to. The repo URL is a Terraform variable (`gitops_repo_url`); ArgoCD must be able to read it, so use a **public** repo (or add repo credentials to ArgoCD).
-- You do not need `kubectl` locally. Where a cluster command is unavoidable use **AWS CloudShell** (browser terminal with kubectl) after `aws eks update-kubeconfig ...` (printed by Terraform).
+You do not need `kubectl`. If you ever want a cluster shell, use **Cloud Shell** in the Google Cloud console and run the `gke_get_credentials` command that Terraform prints.
 
-## 1b. Test locally first (no AWS, about 5 minutes)
+## 1b. Test locally first (no cloud, about 5 minutes)
 
 ```bash
 npm ci && npm test                                   # unit tests (use Node 22)
 docker compose -f docker-compose.yml -f docker-compose.full.yml up -d --build
 scripts/e2e-local.sh                                 # 6 failed logins -> incident via the query API
-docker run --rm -v "$PWD/loadtest:/lt:ro" grafana/k6 run -e PROFILE=smoke   -e BASE_URL=http://host.docker.internal:3000 /lt/ingest-load.js
+docker run --rm -v "$PWD/loadtest:/lt:ro" grafana/k6 run -e PROFILE=smoke \
+  -e BASE_URL=http://host.docker.internal:3000 /lt/ingest-load.js
 docker compose -f docker-compose.yml -f docker-compose.full.yml down -v
 ```
 
-This runs every service except the Flink job (the Lambda handler is driven by a local Kafka consumer). Verified on 17 Nov 2026: e2e PASS, k6 smoke 0% errors.
+Runs every service except Flink; the normalizer handler is driven by a local Kafka consumer. Verified 17 Nov 2026: e2e PASS, k6 smoke 0% errors, Cloud Run function entry point PASS.
 
 ## 2. Provision the infrastructure
+
+Create `infra/terraform/terraform.tfvars` (it is git-ignored, never commit it):
+
+```hcl
+gcp_project_id             = "<your-gcp-project-id>"
+confluent_cloud_api_key    = "<confluent cloud api key>"
+confluent_cloud_api_secret = "<confluent cloud api secret>"
+gitops_repo_url            = "https://github.com/<you>/<repo>.git"
+argocd_admin_password      = "<pick one>"
+grafana_admin_password     = "<pick one>"
+```
+
+Then:
 
 ```bash
 cd infra/terraform
 terraform init
 
-# Two-step first apply: Helm/Kubernetes providers need the cluster to exist.
-terraform apply -target=module.vpc -target=module.eks \
-  -var gitops_repo_url=https://github.com/<you>/<repo>.git
-terraform apply \
-  -var gitops_repo_url=https://github.com/<you>/<repo>.git \
-  -var 'argocd_admin_password=<choose>' -var 'grafana_admin_password=<choose>'
+# Step 1: network, cluster, Kafka (the Helm/Kubernetes providers need the cluster first)
+terraform apply -target=google_container_node_pool.main -target=confluent_kafka_topic.topics
+
+# Step 2: everything else
+terraform apply
 ```
 
-Takes ~25-35 min (EKS, MSK, EMR, RDS are slow). Before the full apply, install the Lambda's dependencies: `cd services/event-normalizer && npm ci --omit=dev` (they are already committed in this repo, so usually nothing to do).
+Takes ~25-35 minutes (Cloud SQL, GKE, Dataproc and the function build are the slow parts). If the first run fails on an API that was "just enabled", wait a minute and run `terraform apply` again. If an IP in `load_balancer_ips` says "pending", run `terraform apply` once more.
 
-`terraform output` then shows the ECR registry, RDS/MSK endpoints, and the ArgoCD and Grafana URLs. If a load-balancer hostname says "pending", run `terraform apply` once more.
+What it creates: VPC + Cloud NAT, GKE (autoscaling 2-5 nodes), Artifact Registry, Confluent environment/cluster/topics/API key/connector, the Cloud Run function, Dataproc with Flink, Cloud SQL PostgreSQL 16 (private IP), two Cloud Storage buckets, DynamoDB tables (AWS), Argo CD + root app, Prometheus/Grafana, Loki/Promtail, the `cloud-sec` namespace, the `infra-endpoints` ConfigMap and three Secrets (`kafka-credentials`, `incident-db`, `event-store-cloud`).
 
-What Terraform created (module `modules/core-data` is Rishit's data layer: DynamoDB `cs-events`, `cs-correlations`, `cs-tpc`, the raw-events S3 bucket, RDS PostgreSQL 16 and the event-store IAM policy):
-VPC + NAT, EKS (+ metrics-server), ECR repos, MSK, Lambda + MSK trigger, EMR (Flink), ArgoCD + root app, kube-prometheus-stack, Loki/Promtail, the `cloud-sec` namespace, the `event-store` service account (IRSA), the `infra-endpoints` ConfigMap and the `incident-db` Secret.
-
-## 3. Point GitOps at your registry
+## 3. Point GitOps at your registry and push
 
 ```bash
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-scripts/set-account-id.sh "$ACCOUNT_ID"          # rewrites ACCOUNT_ID in gitops/
-git add gitops && git commit -m "gitops: set ECR registry" && git push origin main
+scripts/set-registry.sh <your-gcp-project-id>        # rewrites PROJECT_ID in gitops/
+git add gitops && git commit -m "gitops: set registry" && git push origin main
 ```
 
-ArgoCD (already watching `gitops/argocd` on `main`) now creates all service Applications. Pods stay `ImagePullBackOff` until images exist (next step).
+Argo CD (already watching `gitops/argocd` on `main`) creates all service Applications. Pods sit in `ImagePullBackOff` until images exist (next step).
 
 ## 4. Build images
 
-Option A, CI (preferred): add repo secrets `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (and variable `AWS_REGION` if not `ap-south-1`) in GitHub, then push any change to `main`. `.github/workflows/ci.yml` runs the tests, builds the six images, pushes them to ECR tagged with the commit SHA, then **commits the new tag into `gitops/services/*/kustomization.yaml`**. ArgoCD sees that commit and rolls out. That commit is the only way a deployment changes.
+**Option A, CI (preferred).** In GitHub -> Settings -> Secrets and variables -> Actions:
+- secret `GCP_SA_KEY` = output of `terraform -chdir=infra/terraform output -raw ci_service_account_key | base64 -d`
+- variable `GCP_PROJECT_ID` = your project id (and `GCP_REGION` if not `asia-south1`)
 
-Option B, by hand (first bootstrap, or if CI is not set up): from the repo root
+Push any change to `main`. `.github/workflows/ci.yml` tests, builds the six images, pushes them to Artifact Registry tagged with the commit SHA, then commits that tag into `gitops/services/*/kustomization.yaml`. Argo CD syncs the commit. That commit is the only way a deployment changes.
+
+**Option B, by hand** (from the repo root):
 
 ```bash
-REG=$ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com
-aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin $REG
+REG=asia-south1-docker.pkg.dev/<your-gcp-project-id>/cloud-sec
+gcloud auth configure-docker asia-south1-docker.pkg.dev
 TAG=v1
-docker build -t $REG/cloud-sec/log-ingestion:$TAG        services/log-ingestion
-docker build -t $REG/cloud-sec/detection-rules:$TAG      services/detection-rules
+docker build -t $REG/log-ingestion:$TAG   services/log-ingestion
+docker build -t $REG/detection-rules:$TAG services/detection-rules
 for s in event-store incident-management correlation-engine investigation-query-api; do
-  docker build -f services/$s/Dockerfile -t $REG/cloud-sec/$s:$TAG .
+  docker build -f services/$s/Dockerfile -t $REG/$s:$TAG .
 done
 for s in log-ingestion detection-rules event-store incident-management correlation-engine investigation-query-api; do
-  docker push $REG/cloud-sec/$s:$TAG
+  docker push $REG/$s:$TAG
 done
-# then set newTag: v1 in each gitops/services/*/kustomization.yaml, commit and push
 sed -i "s/newTag: .*/newTag: $TAG/" gitops/services/*/kustomization.yaml
 git commit -am "gitops: deploy $TAG" && git push origin main
 ```
 
-## 5. Deploy the Flink job (security-analytics)
+## 5. Deploy the Flink job on Dataproc
 
 ```bash
-cd services/security-analytics && mvn -q package -DskipTests
-BUCKET=$(terraform -chdir=../../infra/terraform output -raw artifacts_bucket)
-aws s3 cp target/security-analytics-1.0.0.jar s3://$BUCKET/artifacts/security-analytics.jar   # the shaded jar, not original-*.jar
+# build (Maven via Docker, no local Java needed)
+docker run --rm -v "$PWD/services/security-analytics:/w" -w /w maven:3.9-eclipse-temurin-17 mvn -q -B package
+BUCKET=$(terraform -chdir=infra/terraform output -raw artifacts_bucket)
+gcloud storage cp services/security-analytics/target/security-analytics-1.0.0.jar gs://$BUCKET/artifacts/security-analytics.jar
+
+# submit (the exact command is also printed as the flink_submit_command output)
+$(terraform -chdir=infra/terraform output -raw flink_submit_command)
 ```
 
-The cluster submits the job as a step at creation. If the jar was not uploaded yet that step failed (harmless): re-submit from the **EMR console -> your cluster -> Steps -> Add step** (type Custom JAR, JAR `command-runner.jar`, arguments = the same `flink run -m yarn-cluster -d ...` line shown in `infra/terraform/emr.tf`), or `aws emr add-steps`. Confirm in the EMR console (Application user interfaces -> Flink) that the job is RUNNING.
+Kafka address and credentials reach the job through the cluster's `flink:containerized.*.env.*` properties set by Terraform, so the submit command needs no arguments. Check it in the console: **Dataproc -> Clusters -> cloud-sec-flink -> Web Interfaces -> Flink** (job RUNNING) and **Jobs**.
+
+The job is built for Flink 1.17 on Java 11 to match the Dataproc 2.2 image.
 
 ## 6. Verify
 
-All checks work from a browser or `curl`; no kubectl required.
+All from a browser or `curl`; no kubectl.
 
-1. **ArgoCD** (hostname in the `load_balancer_hostnames` Terraform output, user `admin`, the password you set): every Application `Synced` + `Healthy`. Click `log-ingestion` -> the Service node shows its public LoadBalancer hostname.
-2. **Send an event** (replace the host):
+1. **Argo CD:** `http://<load_balancer_ips.argocd>`, user `admin`, your password. Every Application `Synced` + `Healthy`. Click `log-ingestion` and `investigation-query-api`; the Service node shows each external IP.
+2. **Send events:**
    ```bash
-   curl -s -X POST http://<log-ingestion-host>/events -H 'content-type: application/json' -d '{
-     "source":{"type":"auth_log","name":"bastion-ssh"},"format":"text",
-     "payload":"Nov 16 10:00:00 bastion sshd[1234]: Failed password for root from 203.0.113.9 port 4242 ssh2"}'
-   # -> 202 {"eventId":"...","status":"published"}
+   for i in 1 2 3 4 5 6; do
+     curl -s -X POST http://<log-ingestion-ip>/events -H 'content-type: application/json' -d \
+       "{\"source\":{\"type\":\"auth_log\",\"name\":\"bastion-ssh\"},\"format\":\"text\",\"payload\":\"Nov 16 10:00:0$i bastion sshd[1]: Failed password for root from 203.0.113.9 port 4242$i ssh2\"}"
+   done
+   curl -s http://<query-api-ip>/incidents | jq
+   curl -s http://<query-api-ip>/incidents/<incidentId> | jq    # incident + history + correlation history + events
    ```
-   Send 5+ of these from the same IP inside a minute to trigger `RULE-AUTH-001`; after a few seconds an incident exists:
-   ```bash
-   curl -s http://<investigation-query-api-host>/incidents | jq
-   curl -s http://<investigation-query-api-host>/incidents/<incidentId> | jq     # incident + history + correlation history + events
-   ```
-3. **Pipeline evidence in the AWS console:** Lambda `...-event-normalizer` (Monitor -> invocations/logs), MSK topics, DynamoDB `cs-events` / `cs-tpc` items, S3 raw bucket objects under `raw/`, RDS tables via the query API, EMR Flink job.
-4. **Grafana** (hostname in `load_balancer_hostnames`, user `admin`): dashboard "Cloud Security Monitoring" (RPS, 5xx rate, p50/p95/p99, HPA replicas, CPU/memory, node and pod health) and Explore -> Loki `{namespace="cloud-sec"}` for logs of every service.
+3. **Pipeline evidence:**
+   - Confluent Cloud console: topics with messages; **Connectors -> cloud-sec-normalizer-trigger** Running, records processed.
+   - Google Cloud console: **Cloud Run functions -> cloud-sec-event-normalizer** (invocations, logs); **Cloud Storage** raw bucket objects under `raw/`; **Cloud SQL**; **Dataproc** Flink job.
+   - AWS console: DynamoDB `cs-events`, `cs-correlations`, `cs-tpc` items.
+4. **Grafana:** `http://<load_balancer_ips.grafana>`, user `admin`. Dashboard "Cloud Security Monitoring" and Explore -> Loki `{namespace="cloud-sec"}`. Function logs are in Cloud Logging; Flink logs in the Dataproc job page.
 
 ## 7. Load test (HPA scaling)
 
 ```bash
-k6 run -e BASE_URL=http://<log-ingestion-host> loadtest/ingest-load.js
+docker run --rm -v "$PWD/loadtest:/lt:ro" grafana/k6 run -e BASE_URL=http://<log-ingestion-ip> /lt/ingest-load.js
 ```
 
-Watch the Grafana panel "HPA replicas (current vs desired)" and ArgoCD's resource tree (pods appear as the Deployment scales): log-ingestion goes 2 -> up to 8 pods, then back after the load stops. Screenshot both for the report. See `loadtest/README.md`.
+Watch the Grafana panel "HPA replicas (current vs desired)" and Argo CD's resource tree: log-ingestion goes 2 -> up to 8 pods, and the node pool grows if needed, then both shrink after the load stops. Screenshot for the report.
 
 ## 8. Demonstrating 3PC (requirement f)
 
-The fault-injection switches (`TPC_FORCE_VOTE`, `TPC_FAULT`) must **never** be set through GitOps. Demo the failure scenarios locally on Docker Compose: `docker compose up -d --build` then `scripts/demo-3pc.sh` (see `docs/handoff.md`, "3PC demo"). In the cloud show the happy path: the incident in the query API, the COMMITTED transaction in the `cs-tpc` DynamoDB table (event-store participant) and the matching version in `cs-correlations`, plus the incident-management logs in Grafana/Loki (`{app="incident-management"}`).
+Fault switches (`TPC_FORCE_VOTE`, `TPC_FAULT`) must never be set through GitOps. Demo the failure scenarios locally: `docker compose up -d --build` then `scripts/demo-3pc.sh` (see `docs/handoff.md`, "3PC demo"). In the cloud show the happy path: the incident in the query API, its committed transaction in DynamoDB `cs-tpc`, the matching version in `cs-correlations`, and incident-management's logs in Grafana/Loki (`{app="incident-management"}`).
 
 ## 9. Teardown
 
 ```bash
-# 1. remove LoadBalancer Services first, otherwise their ELBs block VPC deletion
-#    (delete the 'root' app in the ArgoCD UI with cascade, or:)
-terraform -chdir=infra/terraform destroy -target=helm_release.argocd_root
-# 2. everything else
-terraform -chdir=infra/terraform destroy
+cd infra/terraform
+terraform destroy -target=helm_release.argocd_root   # removes app LoadBalancers first
+terraform destroy
 ```
-If the destroy stalls on the VPC, delete leftover load balancers / ENIs in the EC2 console and re-run.
+
+If a destroy stalls on the VPC, delete leftover forwarding rules / load balancers in the console and re-run.
 
 ## 10. Known limits and caveats
 
-- **Terraform passes `terraform validate` (1.9) but has never been applied.** Validation checks syntax and references only; expect the first real `apply` to surface AWS-side issues (quotas, instance availability, EMR/MSK version support in your region).
-- Kafka uses MSK's VPC-only plaintext listener (no SASL) because upstream services and the Flink job connect without credentials. Rishit's services support SASL/TLS through `KAFKA_*` env vars if you later switch to Confluent Cloud.
-- The RDS password is copied into a Kubernetes Secret by Terraform (so it is in Terraform state). Keep state private. Production alternative: External Secrets Operator.
-- `investigation-query-api` and `log-ingestion` are public and unauthenticated (demo). Add auth/WAF for anything real.
-- `services/*/node_modules` are committed upstream (1,300+ files). Remove them from Git (`git rm -r --cached`) once the Lambda packaging runs `npm ci` in CI.
-- One `@core/tpc` test ("recovery does not abort a tx that run() committed...") fails on Node 24 / Windows and passes 77/77 on Node 22 / Linux, which is what the images and CI use. Run tests on Node 22.
-- Only `RULE-AUTH-001` exists in detection-rules; the escalation path needs 3 alerts for one entity more than 60 s apart.
+- `terraform validate` passes, but **nothing has been applied** yet; expect the first real apply to surface account-side issues (quotas, an API needing a minute after being enabled, Confluent region availability).
+- Confluent's connector sends **record values only**. The function gives each normalized event a synthetic Kafka origin (`raw-events`, partition 0, offset = receive time); the real topic/partition/offset are not known to it.
+- The function's ingress is open to the internet (Confluent calls it from outside your VPC) but every request needs a Google identity token of the invoker service account.
+- Secrets (Kafka key, DB password, AWS access key, HMAC key) pass through Terraform state and are visible in the Dataproc cluster properties. Keep the state private; production would use Secret Manager + External Secrets.
+- Cloud SQL is reached over its private IP without TLS (traffic stays inside the VPC).
+- One `@core/tpc` test fails on Node 24 / Windows and passes 77/77 on Node 22 / Linux (what the images and CI use).
+- `services/*/node_modules` are committed upstream; consider removing them from Git.

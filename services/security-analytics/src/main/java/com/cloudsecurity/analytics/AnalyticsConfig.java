@@ -19,6 +19,27 @@ public final class AnalyticsConfig {
     public static final String GROUP_ID =
             getEnv("KAFKA_GROUP_ID", "flink-analytics-cg");
 
+    // Confluent Cloud / any SASL_SSL cluster: set both to enable SASL PLAIN over TLS.
+    // Unset = plaintext (local Docker Compose).
+    public static final String KAFKA_USERNAME = getEnv("KAFKA_USERNAME", "");
+
+    public static final String KAFKA_PASSWORD = getEnv("KAFKA_PASSWORD", "");
+
+    /** Client security settings shared by the source and both sinks. */
+    public static java.util.Properties kafkaSecurityProperties() {
+        java.util.Properties props = new java.util.Properties();
+        if (!KAFKA_USERNAME.isEmpty() && !KAFKA_PASSWORD.isEmpty()) {
+            props.setProperty("security.protocol", "SASL_SSL");
+            props.setProperty("sasl.mechanism", "PLAIN");
+            props.setProperty(
+                    "sasl.jaas.config",
+                    "org.apache.kafka.common.security.plain.PlainLoginModule required "
+                            + "username=\"" + KAFKA_USERNAME + "\" "
+                            + "password=\"" + KAFKA_PASSWORD + "\";");
+        }
+        return props;
+    }
+
     public static final String CHECKPOINT_URI =
             getEnv("CHECKPOINT_URI", "file:///tmp/flink-checkpoints");
 

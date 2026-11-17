@@ -15,6 +15,7 @@ public final class KafkaEventSource {
                 .setBootstrapServers(AnalyticsConfig.BOOTSTRAP_SERVERS)
                 .setTopics(AnalyticsConfig.INPUT_TOPIC)
                 .setGroupId(AnalyticsConfig.GROUP_ID)
+                .setProperties(AnalyticsConfig.kafkaSecurityProperties())
                 .setStartingOffsets(
                         OffsetsInitializer.committedOffsets(
                                 OffsetResetStrategy.EARLIEST
