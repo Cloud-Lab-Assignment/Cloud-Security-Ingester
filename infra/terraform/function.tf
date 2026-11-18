@@ -27,7 +27,7 @@ resource "google_cloudfunctions2_function" "normalizer" {
   location = var.gcp_region
 
   build_config {
-    runtime     = "nodejs20"
+    runtime     = "nodejs22"
     entry_point = "normalize"
     source {
       storage_source {
