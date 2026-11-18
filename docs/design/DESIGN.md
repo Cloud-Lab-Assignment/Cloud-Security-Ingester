@@ -50,7 +50,7 @@ flowchart TB
     ar[("Artifact Registry<br/>6 images")]
     subgraph vpc["VPC 10.30.0.0/20 (+ pod/service ranges), Cloud NAT"]
       lb["LoadBalancers: log-ingestion,<br/>query API, Argo CD, Grafana"]
-      subgraph gke["GKE cluster (autoscaling 2-5 nodes)"]
+      subgraph gke["GKE cluster (autoscaling 2-3 nodes)"]
         apps["namespace cloud-sec<br/>6 Deployments, 4 HPAs"]
         argo["Argo CD"]
         obs["Prometheus, Grafana, Loki, Promtail"]
@@ -93,8 +93,8 @@ flowchart TB
 | Layer | Product | Notes |
 |---|---|---|
 | Network | VPC with secondary ranges for pods and services, firewall for internal traffic, Cloud NAT, private services access | NAT gives Dataproc's internal-only nodes a way out to Confluent Cloud |
-| Stateless services | GKE, zonal cluster, one autoscaling node pool (`e2-standard-4`, 2 to 5 nodes) | GKE's built-in metrics server feeds the HPAs; the cluster autoscaler adds nodes when HPAs need room |
-| Serverless | Cloud Run function (2nd gen, Node 20), entry point `normalize` | Invoked by Confluent's managed connector with batches of up to 50 records; IAM-protected |
+| Stateless services | GKE, zonal cluster, one autoscaling node pool (`e2-standard-4`, 2 to 3 nodes; the free-trial quota of 24 vCPUs is shared with Dataproc) | GKE's built-in metrics server feeds the HPAs; the cluster autoscaler adds nodes when HPAs need room |
+| Serverless | Cloud Run function (2nd gen, Node 22), entry point `normalize` | Invoked by Confluent's managed connector with batches of up to 50 records; IAM-protected |
 | Stream processing | Dataproc 2.2 with the Flink optional component (Flink 1.17, Java 11) | Job submitted with `gcloud dataproc jobs submit flink`; checkpoints in Cloud Storage; Flink UI through Component Gateway |
 | Messaging | Confluent Cloud Basic cluster on GCP | SASL PLAIN over TLS; topics created by Terraform with three partitions each |
 | Storage | Cloud Storage, Cloud SQL PostgreSQL 16, DynamoDB | Section 5 |
@@ -157,7 +157,7 @@ flowchart LR
 | # | Service | Responsibility | Runtime | Scaling |
 |---|---|---|---|---|
 | 1 | Log Ingestion | Public entry point. Validates an event, adds an ID and receive time, publishes to `raw-events`. Returns 202 once Kafka has acknowledged. | Node 22, Fastify, GKE, port 3000 | HPA 2 to 8, CPU 50% |
-| 2 | Event Normalizer | Converts raw events to the common schema (category, action, outcome, actor, network, entity key). Routes invalid events to the DLQ. Same handler code as the earlier Lambda version; `src/gcf.js` adapts the HTTP request. | Cloud Run function (2nd gen), Node 20 | Cloud Run instances, up to 10 |
+| 2 | Event Normalizer | Converts raw events to the common schema (category, action, outcome, actor, network, entity key). Routes invalid events to the DLQ. Same handler code as the earlier Lambda version; `src/gcf.js` adapts the HTTP request. | Cloud Run function (2nd gen), Node 22 | Cloud Run instances, up to 10 |
 | 3 | Correlation Engine | Groups alerts per entity inside a 15-minute window, escalates severity after three alerts, enriches from the Event Store, upserts the incident. | Node 22, GKE, port 8083 | HPA 1 to 3, CPU 70% |
 | 4 | Event Store | Archives raw events to Cloud Storage, stores normalized events and correlation history in DynamoDB, serves them over REST. 3PC participant. | Node 22, GKE, port 8081 | HPA 1 to 3, CPU 70% |
 | 5 | Detection Rules | Evaluates normalized events against rules and emits alerts. One rule today: repeated failed logins from one IP. | Node 22, GKE, no HTTP | HPA 1 to 3, CPU 60% |
@@ -230,7 +230,7 @@ The states, timeouts, recovery rules, the cases in which the guarantee can break
 - **Manifests.** `gitops/services/<name>/` holds a Deployment, Service, ServiceMonitor and, where it applies, an HPA, assembled with Kustomize. `gitops/argocd/` holds one Argo CD `Application` per service plus one for the Grafana dashboard.
 - **App of apps.** Terraform installs Argo CD and a single root Application that tracks `gitops/argocd` on `main`. Everything else is discovered from Git. Sync is automatic with pruning and self-healing, so a manual change in the cluster is reverted.
 - **Delivery.** GitHub Actions runs the tests, builds the six images, pushes them to Artifact Registry tagged with the commit SHA, and commits that tag into each `kustomization.yaml`. Argo CD notices the commit and rolls out. CI's service account can only write images; it has no cluster credentials.
-- **Autoscaling.** HPAs use CPU (and memory at 80%) against container requests of 100 m CPU and 128 Mi. Scale-up is immediate, scale-down waits two minutes. When pods do not fit, the GKE cluster autoscaler adds nodes (up to five). Detection Rules, Correlation Engine and Event Store are capped at three replicas because their topics have three partitions, so more consumers would sit idle.
+- **Autoscaling.** HPAs use CPU (and memory at 80%) against container requests of 100 m CPU and 128 Mi. Scale-up is immediate, scale-down waits two minutes. When pods do not fit, the GKE cluster autoscaler adds nodes (up to three). Detection Rules, Correlation Engine and Event Store are capped at three replicas because their topics have three partitions, so more consumers would sit idle.
 - **Load test.** `loadtest/ingest-load.js` (k6) uses an open arrival-rate model: 20 requests per second, ramp to 300, hold five minutes, then drop. Events are realistic and reuse a small pool of source IPs so the detection rule fires. Thresholds: under 2% errors, p95 under 800 ms.
 
 ## 8. Observability (requirement h)

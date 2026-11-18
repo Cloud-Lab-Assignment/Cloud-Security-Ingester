@@ -15,6 +15,9 @@ on:
       - "docs/**"
       - "infra/**"
   pull_request:
+  # "Run workflow" button in the Actions tab: builds and deploys whatever is on
+  # main, e.g. after a gitops-only change that the paths-ignore above skips.
+  workflow_dispatch:
 
 env:
   GCP_REGION: ${{ vars.GCP_REGION || 'asia-south1' }}
@@ -67,7 +70,7 @@ jobs:
   images:
     needs: [test, publish-config]
     # Skipped (not failed) until the GCP_SA_KEY secret and GCP_PROJECT_ID variable exist.
-    if: github.event_name == 'push' && needs.publish-config.outputs.ready == 'true'
+    if: github.event_name != 'pull_request' && needs.publish-config.outputs.ready == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -7,7 +7,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/ashkew2202/Cloud-Security-Ingester.git
+    repoURL: https://github.com/Cloud-Lab-Assignment/Cloud-Security-Ingester.git
     targetRevision: main
     path: gitops/observability
   destination:

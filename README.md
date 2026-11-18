@@ -13,6 +13,7 @@ Infrastructure is Terraform (`infra/terraform`), deployments are ArgoCD from `gi
 | `gitops/` | ArgoCD Applications, Kustomize manifests, HPAs, Grafana dashboard |
 | `loadtest/` | k6 load test for the HPA demo |
 | `docs/DEPLOYMENT.md` | **step-by-step deployment and demo guide** |
+| `docs/TESTING.md` | **how to test each deployed service** |
 | `docs/design/DESIGN.md` | **design document** (whole system) |
 | `docs/handoff.md`, `docs/design/core-services.md` | core services contracts and detailed 3PC design (Rishit) |
 | `docs/task_division.txt` | who did what |

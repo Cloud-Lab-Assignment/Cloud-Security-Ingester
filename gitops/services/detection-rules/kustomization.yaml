@@ -7,5 +7,5 @@ resources:
 images:
   # CI (.github/workflows/ci.yml) bumps newTag in a Git commit -> ArgoCD syncs.
   # PROJECT_ID is replaced by scripts/set-registry.sh.
-  - name: asia-south1-docker.pkg.dev/PROJECT_ID/cloud-sec/detection-rules
+  - name: asia-south1-docker.pkg.dev/project-01b2c261-3004-404e-9a0/cloud-sec/detection-rules
     newTag: latest

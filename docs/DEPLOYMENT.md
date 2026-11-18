@@ -77,7 +77,7 @@ terraform apply
 
 Takes ~25-35 minutes (Cloud SQL, GKE, Dataproc and the function build are the slow parts). If the first run fails on an API that was "just enabled", wait a minute and run `terraform apply` again. If an IP in `load_balancer_ips` says "pending", run `terraform apply` once more.
 
-What it creates: VPC + Cloud NAT, GKE (autoscaling 2-5 nodes), Artifact Registry, Confluent environment/cluster/topics/API key/connector, the Cloud Run function, Dataproc with Flink, Cloud SQL PostgreSQL 16 (private IP), two Cloud Storage buckets, DynamoDB tables (AWS), Argo CD + root app, Prometheus/Grafana, Loki/Promtail, the `cloud-sec` namespace, the `infra-endpoints` ConfigMap and three Secrets (`kafka-credentials`, `incident-db`, `event-store-cloud`).
+What it creates: VPC + Cloud NAT, GKE (autoscaling 2-3 nodes: the free trial allows 24 vCPUs and Dataproc uses part of them), Artifact Registry, Confluent environment/cluster/topics/API key/connector, the Cloud Run function, Dataproc with Flink, Cloud SQL PostgreSQL 16 (private IP), two Cloud Storage buckets, DynamoDB tables (AWS), Argo CD + root app, Prometheus/Grafana, Loki/Promtail, the `cloud-sec` namespace, the `infra-endpoints` ConfigMap and three Secrets (`kafka-credentials`, `incident-db`, `event-store-cloud`).
 
 ## 3. Point GitOps at your registry and push
 
@@ -90,11 +90,11 @@ Argo CD (already watching `gitops/argocd` on `main`) creates all service Applica
 
 ## 4. Build images
 
-**Option A, CI (preferred).** In GitHub -> Settings -> Secrets and variables -> Actions:
+**Option A, CI (preferred).** In GitHub -> Settings -> Actions -> General -> Workflow permissions, choose **Read and write** (CI commits the new image tags). Then in Settings -> Secrets and variables -> Actions:
 - secret `GCP_SA_KEY` = output of `terraform -chdir=infra/terraform output -raw ci_service_account_key | base64 -d`
 - variable `GCP_PROJECT_ID` = your project id (and `GCP_REGION` if not `asia-south1`)
 
-Push any change to `main`. `.github/workflows/ci.yml` tests, builds the six images, pushes them to Artifact Registry tagged with the commit SHA, then commits that tag into `gitops/services/*/kustomization.yaml`. Argo CD syncs the commit. That commit is the only way a deployment changes.
+Push any change to `main`, or open **Actions -> ci -> Run workflow**. `.github/workflows/ci.yml` tests, builds the six images, pushes them to Artifact Registry tagged with the commit SHA, then commits that tag into `gitops/services/*/kustomization.yaml`. Argo CD syncs the commit. That commit is the only way a deployment changes.
 
 **Option B, by hand** (from the repo root):
 

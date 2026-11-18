@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: log-ingestion
-          image: asia-south1-docker.pkg.dev/PROJECT_ID/cloud-sec/log-ingestion:latest
+          image: asia-south1-docker.pkg.dev/project-01b2c261-3004-404e-9a0/cloud-sec/log-ingestion:latest
           ports:
             - {name: http, containerPort: 3000}
           envFrom:

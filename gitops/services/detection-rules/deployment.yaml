@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: detection-rules
-          image: asia-south1-docker.pkg.dev/PROJECT_ID/cloud-sec/detection-rules:latest
+          image: asia-south1-docker.pkg.dev/project-01b2c261-3004-404e-9a0/cloud-sec/detection-rules:latest
           envFrom:
             - configMapRef: {name: infra-endpoints}
             - secretRef: {name: kafka-credentials}

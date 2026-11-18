@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: incident-management
-          image: asia-south1-docker.pkg.dev/PROJECT_ID/cloud-sec/incident-management:latest
+          image: asia-south1-docker.pkg.dev/project-01b2c261-3004-404e-9a0/cloud-sec/incident-management:latest
           ports:
             - {name: http, containerPort: 8082}
             - {name: grpc, containerPort: 50051}
