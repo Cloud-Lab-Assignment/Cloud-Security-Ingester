@@ -23,9 +23,8 @@ All six Deployments should be `Running` and `READY 1/1` (log-ingestion has 2 pod
 
 If pods show `ImagePullBackOff`, the images have not been built yet (`gitops/` already points at the project's Artifact Registry). In GitHub:
 
-1. Settings -> Actions -> General -> Workflow permissions: **Read and write**.
-2. Settings -> Secrets and variables -> Actions: secret `GCP_SA_KEY` (`terraform output -raw ci_service_account_key | base64 -d`, from the Cloud Shell that holds the Terraform state) and variable `GCP_PROJECT_ID` = `project-01b2c261-3004-404e-9a0`.
-3. Actions -> ci -> **Run workflow** on `main`. CI builds the six images, commits the new tag, and Argo CD rolls them out a minute or two later.
+1. Settings -> Secrets and variables -> Actions: secret `GCP_SA_KEY` (`terraform output -raw ci_service_account_key | base64 -d`, from the Cloud Shell that holds the Terraform state) and variable `GCP_PROJECT_ID` = `project-01b2c261-3004-404e-9a0`.
+2. Actions -> ci -> **Run workflow** on `main`. CI builds the six images, commits the new tag, and Argo CD rolls them out a minute or two later.
 
 Then save the two public addresses:
 

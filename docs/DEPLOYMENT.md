@@ -90,7 +90,7 @@ Argo CD (already watching `gitops/argocd` on `main`) creates all service Applica
 
 ## 4. Build images
 
-**Option A, CI (preferred).** In GitHub -> Settings -> Actions -> General -> Workflow permissions, choose **Read and write** (CI commits the new image tags). Then in Settings -> Secrets and variables -> Actions:
+**Option A, CI (preferred).** In GitHub -> Settings -> Secrets and variables -> Actions (the workflow already requests `contents: write` for the jobs that commit, so the repository's default "Workflow permissions" setting does not need changing):
 - secret `GCP_SA_KEY` = output of `terraform -chdir=infra/terraform output -raw ci_service_account_key | base64 -d`
 - variable `GCP_PROJECT_ID` = your project id (and `GCP_REGION` if not `asia-south1`)
 
