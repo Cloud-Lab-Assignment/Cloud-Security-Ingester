@@ -6,7 +6,7 @@ confirm Aaditya's and Neeharika's exact assignments with them.
 
 ID number        | Name        | Tasks
 -----------------+-------------+--------------------------------------------------------------------
-TODO             | Ansh        | Platform and delivery:
+2024A7PS0585     | Ansh        | Platform and delivery:
                  |             |  - Terraform (GCP: VPC, GKE, Artifact Registry, Dataproc, Cloud Run function,
                  |             |    Cloud SQL, Cloud Storage; Confluent Cloud; AWS DynamoDB; Helm add-ons)
                  |             |  - GitOps: ArgoCD app-of-apps, Kustomize manifests, HPAs (requirements c, d)
@@ -15,10 +15,10 @@ TODO             | Ansh        | Platform and delivery:
                  |             |  - k6 load test
                  |             |  - Service 7: Investigation Query API
                  |             |  - Integration of all services, deployment guide, design document
-TODO             | Rishit      | Services: Correlation Engine, Incident Management, Event Store
+2024A7PS0606P    | Rishit      | Services: Correlation Engine, Incident Management, Event Store
                  |             |  - 3PC concept implementation (requirement f)
                  |             |  - Three storage products: S3, DynamoDB, RDS PostgreSQL (requirement g)
                  |             |  - Terraform module infra/terraform/modules/core-data
-TODO             | Aaditya     | Services: Log Ingestion, Event Normalizer (serverless function), Detection Rules,
+2024AD0737P      | Aaditya     | Services: Log Ingestion, Event Normalizer (serverless function), Detection Rules,
                  |             | Security Analytics (Flink job, requirement e)
-TODO             | Neeharika   | Kafka / messaging infrastructure, topics and ACLs (per docs/handoff.md)
+2023A7PS0644P    | Neeharika   | Kafka / messaging infrastructure, topics and ACLs (per docs/handoff.md)
