@@ -1,6 +1,9 @@
-# Picked up by the Grafana sidecar (label grafana_dashboard=1).
-# Metric names assume the shared buildApp()/log-ingestion metrics: http_requests_total{status},
-# http_request_duration_seconds_bucket. Service must expose /metrics.
+# Picked up by the Grafana sidecar (label grafana_dashboard=1) and deployed by Argo CD.
+# Edit the JSON here and push; do not edit the dashboard in the Grafana UI (a sync overwrites it).
+# Metric sources: http_requests_total / http_request_duration_seconds (every HTTP service,
+# label `service`), kube-state-metrics + cAdvisor (HPA, pods, nodes), and service counters
+# alerts_consumed_total, incidents_upserted_total, tpc_transactions_total,
+# events_consumed_total, grpc_requests_total, outbox_held_rows.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -14,47 +17,1523 @@ data:
       "title": "Cloud Security Monitoring",
       "uid": "cloud-sec-overview",
       "schemaVersion": 39,
-      "refresh": "10s",
-      "time": {"from": "now-30m", "to": "now"},
+      "version": 2,
+      "refresh": "5s",
+      "time": {
+        "from": "now-15m",
+        "to": "now"
+      },
+      "timepicker": {
+        "refresh_intervals": [
+          "5s",
+          "10s",
+          "30s",
+          "1m"
+        ]
+      },
+      "tags": [
+        "cloud-sec"
+      ],
       "panels": [
-        {"id": 1, "type": "timeseries", "title": "Request rate (RPS) by service",
-         "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
-         "targets": [{"expr": "sum by (service) (rate(http_requests_total{namespace=\"cloud-sec\"}[1m]))", "legendFormat": "{{service}}"}]},
-        {"id": 2, "type": "timeseries", "title": "Error rate (5xx %)",
-         "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
-         "fieldConfig": {"defaults": {"unit": "percentunit"}},
-         "targets": [{"expr": "sum by (service) (rate(http_requests_total{namespace=\"cloud-sec\",status=~\"5..\"}[1m])) / sum by (service) (rate(http_requests_total{namespace=\"cloud-sec\"}[1m]))", "legendFormat": "{{service}}"}]},
-        {"id": 3, "type": "timeseries", "title": "Latency p50 / p95 / p99",
-         "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
-         "fieldConfig": {"defaults": {"unit": "s"}},
-         "targets": [
-           {"expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"cloud-sec\"}[1m])))", "legendFormat": "p50"},
-           {"expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"cloud-sec\"}[1m])))", "legendFormat": "p95"},
-           {"expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"cloud-sec\"}[1m])))", "legendFormat": "p99"}]},
-        {"id": 4, "type": "timeseries", "title": "HPA replicas (current vs desired)",
-         "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
-         "targets": [
-           {"expr": "kube_horizontalpodautoscaler_status_current_replicas{namespace=\"cloud-sec\"}", "legendFormat": "{{horizontalpodautoscaler}} current"},
-           {"expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"cloud-sec\"}", "legendFormat": "{{horizontalpodautoscaler}} desired"}]},
-        {"id": 5, "type": "timeseries", "title": "Pod CPU (cores) by pod",
-         "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
-         "targets": [{"expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"cloud-sec\",container!=\"\"}[1m]))", "legendFormat": "{{pod}}"}]},
-        {"id": 6, "type": "timeseries", "title": "Pod memory (bytes) by pod",
-         "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
-         "fieldConfig": {"defaults": {"unit": "bytes"}},
-         "targets": [{"expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"cloud-sec\",container!=\"\"})", "legendFormat": "{{pod}}"}]},
-        {"id": 7, "type": "stat", "title": "Nodes Ready",
-         "gridPos": {"x": 0, "y": 24, "w": 6, "h": 4},
-         "targets": [{"expr": "sum(kube_node_status_condition{condition=\"Ready\",status=\"true\"})"}]},
-        {"id": 8, "type": "stat", "title": "Pods not Running",
-         "gridPos": {"x": 6, "y": 24, "w": 6, "h": 4},
-         "targets": [{"expr": "sum(kube_pod_status_phase{namespace=\"cloud-sec\",phase!~\"Running|Succeeded\"})"}]},
-        {"id": 9, "type": "timeseries", "title": "Container restarts",
-         "gridPos": {"x": 12, "y": 24, "w": 12, "h": 4},
-         "targets": [{"expr": "sum by (pod) (increase(kube_pod_container_status_restarts_total{namespace=\"cloud-sec\"}[5m]))", "legendFormat": "{{pod}}"}]},
-        {"id": 10, "type": "logs", "title": "Application logs (Loki)",
-         "gridPos": {"x": 0, "y": 28, "w": 24, "h": 10},
-         "datasource": {"type": "loki", "uid": "loki"},
-         "targets": [{"expr": "{namespace=\"cloud-sec\"}"}]}
+        {
+          "id": 1,
+          "type": "row",
+          "title": "Overview",
+          "collapsed": false,
+          "gridPos": {
+            "x": 0,
+            "y": 0,
+            "w": 24,
+            "h": 1
+          },
+          "panels": []
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "Nodes Ready",
+          "gridPos": {
+            "x": 0,
+            "y": 1,
+            "w": 3,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 1
+                  },
+                  {
+                    "color": "green",
+                    "value": 2
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "area",
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(kube_node_status_condition{condition=\"Ready\",status=\"true\"})"
+            }
+          ],
+          "description": "GKE nodes. The cluster autoscaler grows this from 2 to 3 when pods do not fit."
+        },
+        {
+          "id": 3,
+          "type": "stat",
+          "title": "Pods Running",
+          "gridPos": {
+            "x": 3,
+            "y": 1,
+            "w": 3,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "green",
+                    "value": 6
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "area",
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(kube_pod_status_phase{namespace=\"cloud-sec\",phase=\"Running\"})"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "stat",
+          "title": "Pods not Running",
+          "gridPos": {
+            "x": 6,
+            "y": 1,
+            "w": 3,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 1
+                  },
+                  {
+                    "color": "red",
+                    "value": 5
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "area",
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(kube_pod_status_phase{namespace=\"cloud-sec\",phase=~\"Pending|Failed|Unknown\"}) or vector(0)"
+            }
+          ],
+          "description": "Pending pods under load mean the node pool is at its 3-node cap."
+        },
+        {
+          "id": 5,
+          "type": "stat",
+          "title": "log-ingestion pods",
+          "gridPos": {
+            "x": 9,
+            "y": 1,
+            "w": 3,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 3
+                  },
+                  {
+                    "color": "red",
+                    "value": 6
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "area",
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "kube_horizontalpodautoscaler_status_current_replicas{namespace=\"cloud-sec\",horizontalpodautoscaler=\"log-ingestion\"}"
+            }
+          ],
+          "description": "HPA range is 2 to 8."
+        },
+        {
+          "id": 6,
+          "type": "stat",
+          "title": "Total requests/s",
+          "gridPos": {
+            "x": 12,
+            "y": 1,
+            "w": 3,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "blue",
+                    "value": null
+                  }
+                ]
+              },
+              "decimals": 1
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "area",
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(http_requests_total{namespace=\"cloud-sec\"}[1m])) or vector(0)"
+            }
+          ]
+        },
+        {
+          "id": 7,
+          "type": "stat",
+          "title": "Error rate (5xx)",
+          "gridPos": {
+            "x": 15,
+            "y": 1,
+            "w": 3,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.01
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.02
+                  }
+                ]
+              },
+              "decimals": 2
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "area",
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "(sum(rate(http_requests_total{namespace=\"cloud-sec\",status=~\"5..\"}[1m])) / sum(rate(http_requests_total{namespace=\"cloud-sec\"}[1m]))) or vector(0)"
+            }
+          ],
+          "description": "k6 threshold is under 2%."
+        },
+        {
+          "id": 8,
+          "type": "stat",
+          "title": "p95 latency",
+          "gridPos": {
+            "x": 18,
+            "y": 1,
+            "w": 3,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.5
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.8
+                  }
+                ]
+              },
+              "decimals": 3
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "area",
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"cloud-sec\"}[1m])))"
+            }
+          ],
+          "description": "k6 threshold is under 800 ms."
+        },
+        {
+          "id": 9,
+          "type": "stat",
+          "title": "Incidents (1h)",
+          "gridPos": {
+            "x": 21,
+            "y": 1,
+            "w": 3,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "blue",
+                    "value": null
+                  }
+                ]
+              },
+              "decimals": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "area",
+            "textMode": "value"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(increase(incidents_upserted_total{outcome=\"created\"}[1h])) or vector(0)"
+            }
+          ]
+        },
+        {
+          "id": 10,
+          "type": "row",
+          "title": "Autoscaling (requirement c)",
+          "collapsed": false,
+          "gridPos": {
+            "x": 0,
+            "y": 5,
+            "w": 24,
+            "h": 1
+          },
+          "panels": []
+        },
+        {
+          "id": 11,
+          "type": "timeseries",
+          "title": "HPA replicas: current vs desired",
+          "gridPos": {
+            "x": 0,
+            "y": 6,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "kube_horizontalpodautoscaler_status_current_replicas{namespace=\"cloud-sec\"}",
+              "legendFormat": "{{horizontalpodautoscaler}} current"
+            },
+            {
+              "refId": "B",
+              "expr": "kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"cloud-sec\"}",
+              "legendFormat": "{{horizontalpodautoscaler}} desired"
+            }
+          ],
+          "description": "Desired above current for a while means pods are Pending (no node room) or still starting."
+        },
+        {
+          "id": 12,
+          "type": "timeseries",
+          "title": "CPU as % of request, per pod (what the HPA watches)",
+          "gridPos": {
+            "x": 12,
+            "y": 6,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 5,
+                "showPoints": "never",
+                "spanNulls": true,
+                "thresholdsStyle": {
+                  "mode": "line"
+                }
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.5
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.7
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"cloud-sec\",container!=\"\"}[1m])) / sum by (pod) (kube_pod_container_resource_requests{namespace=\"cloud-sec\",resource=\"cpu\"})",
+              "legendFormat": "{{pod}}"
+            }
+          ],
+          "description": "log-ingestion scales out when its average crosses 50%. Others: detection-rules 60%, correlation-engine 70%, event-store 70%."
+        },
+        {
+          "id": 13,
+          "type": "timeseries",
+          "title": "Available pods per Deployment",
+          "gridPos": {
+            "x": 0,
+            "y": 14,
+            "w": 8,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "kube_deployment_status_replicas_available{namespace=\"cloud-sec\"}",
+              "legendFormat": "{{deployment}}"
+            }
+          ]
+        },
+        {
+          "id": 14,
+          "type": "timeseries",
+          "title": "Cluster nodes",
+          "gridPos": {
+            "x": 8,
+            "y": 14,
+            "w": 8,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": true
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "count(kube_node_info)",
+              "legendFormat": "nodes"
+            },
+            {
+              "refId": "B",
+              "expr": "sum(kube_node_status_condition{condition=\"Ready\",status=\"true\"})",
+              "legendFormat": "ready"
+            }
+          ]
+        },
+        {
+          "id": 15,
+          "type": "timeseries",
+          "title": "Pending pods",
+          "gridPos": {
+            "x": 16,
+            "y": 14,
+            "w": 8,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 20,
+                "showPoints": "never",
+                "spanNulls": true
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(kube_pod_status_phase{namespace=\"cloud-sec\",phase=\"Pending\"})",
+              "legendFormat": "pending"
+            }
+          ],
+          "description": "Non-zero while scaling out means the 3-node cap (24 vCPU free-trial quota) is reached."
+        },
+        {
+          "id": 16,
+          "type": "row",
+          "title": "Load and latency (k6 stress test)",
+          "collapsed": false,
+          "gridPos": {
+            "x": 0,
+            "y": 21,
+            "w": 24,
+            "h": 1
+          },
+          "panels": []
+        },
+        {
+          "id": 17,
+          "type": "timeseries",
+          "title": "Requests per second by service",
+          "gridPos": {
+            "x": 0,
+            "y": 22,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "normal",
+                  "group": "A"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (service) (rate(http_requests_total{namespace=\"cloud-sec\"}[1m]))",
+              "legendFormat": "{{service}}"
+            }
+          ]
+        },
+        {
+          "id": 18,
+          "type": "timeseries",
+          "title": "Responses by status code",
+          "gridPos": {
+            "x": 12,
+            "y": 22,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "normal",
+                  "group": "A"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (status) (rate(http_requests_total{namespace=\"cloud-sec\"}[1m]))",
+              "legendFormat": "{{status}}"
+            }
+          ],
+          "description": "2xx/202 is the pipeline accepting events; any 5xx is a failure."
+        },
+        {
+          "id": 19,
+          "type": "timeseries",
+          "title": "Latency p50 / p95 / p99 (all services)",
+          "gridPos": {
+            "x": 0,
+            "y": 30,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": true,
+                "thresholdsStyle": {
+                  "mode": "line"
+                }
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.8
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"cloud-sec\"}[1m])))",
+              "legendFormat": "p50"
+            },
+            {
+              "refId": "B",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"cloud-sec\"}[1m])))",
+              "legendFormat": "p95"
+            },
+            {
+              "refId": "C",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"cloud-sec\"}[1m])))",
+              "legendFormat": "p99"
+            }
+          ],
+          "description": "Red line = the k6 p95 threshold (800 ms)."
+        },
+        {
+          "id": 20,
+          "type": "timeseries",
+          "title": "p95 latency by service",
+          "gridPos": {
+            "x": 12,
+            "y": 30,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.95, sum by (le, service) (rate(http_request_duration_seconds_bucket{namespace=\"cloud-sec\"}[1m])))",
+              "legendFormat": "{{service}}"
+            }
+          ]
+        },
+        {
+          "id": 21,
+          "type": "timeseries",
+          "title": "Error rate (5xx) by service",
+          "gridPos": {
+            "x": 0,
+            "y": 38,
+            "w": 12,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": true,
+                "thresholdsStyle": {
+                  "mode": "line"
+                }
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.02
+                  }
+                ]
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (service) (rate(http_requests_total{namespace=\"cloud-sec\",status=~\"5..\"}[1m])) / sum by (service) (rate(http_requests_total{namespace=\"cloud-sec\"}[1m]))",
+              "legendFormat": "{{service}}"
+            }
+          ]
+        },
+        {
+          "id": 22,
+          "type": "timeseries",
+          "title": "log-ingestion requests by route",
+          "gridPos": {
+            "x": 12,
+            "y": 38,
+            "w": 12,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "normal",
+                  "group": "A"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (route, status) (rate(http_requests_total{namespace=\"cloud-sec\",service=\"log-ingestion\"}[1m]))",
+              "legendFormat": "{{route}} {{status}}"
+            }
+          ]
+        },
+        {
+          "id": 23,
+          "type": "row",
+          "title": "Pipeline and 3PC (requirements b, f)",
+          "collapsed": false,
+          "gridPos": {
+            "x": 0,
+            "y": 45,
+            "w": 24,
+            "h": 1
+          },
+          "panels": []
+        },
+        {
+          "id": 24,
+          "type": "timeseries",
+          "title": "Alerts consumed by correlation-engine",
+          "gridPos": {
+            "x": 0,
+            "y": 46,
+            "w": 8,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "normal",
+                  "group": "A"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (result) (rate(alerts_consumed_total[1m]))",
+              "legendFormat": "{{result}}"
+            }
+          ]
+        },
+        {
+          "id": 25,
+          "type": "timeseries",
+          "title": "Incidents upserted (5 min)",
+          "gridPos": {
+            "x": 8,
+            "y": 46,
+            "w": 8,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 25,
+                "showPoints": "never",
+                "spanNulls": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (outcome) (increase(incidents_upserted_total[5m]))",
+              "legendFormat": "{{outcome}}"
+            }
+          ]
+        },
+        {
+          "id": 26,
+          "type": "timeseries",
+          "title": "3PC transactions by outcome (5 min)",
+          "gridPos": {
+            "x": 16,
+            "y": 46,
+            "w": 8,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 25,
+                "showPoints": "never",
+                "spanNulls": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (outcome) (increase(tpc_transactions_total[5m]))",
+              "legendFormat": "{{outcome}}"
+            }
+          ],
+          "description": "committed = both Postgres and DynamoDB wrote. aborted = a participant voted no."
+        },
+        {
+          "id": 27,
+          "type": "timeseries",
+          "title": "Event Store: Kafka messages consumed",
+          "gridPos": {
+            "x": 0,
+            "y": 53,
+            "w": 8,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "normal",
+                  "group": "A"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (topic, result) (rate(events_consumed_total[1m]))",
+              "legendFormat": "{{topic}} {{result}}"
+            }
+          ]
+        },
+        {
+          "id": 28,
+          "type": "timeseries",
+          "title": "gRPC: UpsertIncident by status code",
+          "gridPos": {
+            "x": 8,
+            "y": 53,
+            "w": 8,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "showPoints": "never",
+                "spanNulls": true,
+                "stacking": {
+                  "mode": "normal",
+                  "group": "A"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (method, code) (rate(grpc_requests_total[1m]))",
+              "legendFormat": "{{method}} {{code}}"
+            }
+          ]
+        },
+        {
+          "id": 29,
+          "type": "timeseries",
+          "title": "gRPC latency p95 and outbox backlog",
+          "gridPos": {
+            "x": 16,
+            "y": 53,
+            "w": 8,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.95, sum by (le, method) (rate(grpc_request_duration_seconds_bucket[1m])))",
+              "legendFormat": "p95 {{method}}"
+            },
+            {
+              "refId": "B",
+              "expr": "sum(outbox_held_rows)",
+              "legendFormat": "outbox held rows"
+            }
+          ]
+        },
+        {
+          "id": 30,
+          "type": "row",
+          "title": "Resources",
+          "collapsed": false,
+          "gridPos": {
+            "x": 0,
+            "y": 60,
+            "w": 24,
+            "h": 1
+          },
+          "panels": []
+        },
+        {
+          "id": 31,
+          "type": "timeseries",
+          "title": "Pod CPU (cores)",
+          "gridPos": {
+            "x": 0,
+            "y": 61,
+            "w": 12,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 5,
+                "showPoints": "never",
+                "spanNulls": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"cloud-sec\",container!=\"\"}[1m]))",
+              "legendFormat": "{{pod}}"
+            }
+          ]
+        },
+        {
+          "id": 32,
+          "type": "timeseries",
+          "title": "Pod memory",
+          "gridPos": {
+            "x": 12,
+            "y": 61,
+            "w": 12,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 5,
+                "showPoints": "never",
+                "spanNulls": true
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"cloud-sec\",container!=\"\"})",
+              "legendFormat": "{{pod}}"
+            }
+          ]
+        },
+        {
+          "id": 33,
+          "type": "timeseries",
+          "title": "Container restarts (5 min)",
+          "gridPos": {
+            "x": 0,
+            "y": 68,
+            "w": 24,
+            "h": 6
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": true
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (pod) (increase(kube_pod_container_status_restarts_total{namespace=\"cloud-sec\"}[5m]))",
+              "legendFormat": "{{pod}}"
+            }
+          ]
+        },
+        {
+          "id": 34,
+          "type": "row",
+          "title": "Logs (Loki)",
+          "collapsed": false,
+          "gridPos": {
+            "x": 0,
+            "y": 74,
+            "w": 24,
+            "h": 1
+          },
+          "panels": []
+        },
+        {
+          "id": 35,
+          "type": "logs",
+          "title": "Application logs",
+          "gridPos": {
+            "x": 0,
+            "y": 75,
+            "w": 24,
+            "h": 11
+          },
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "options": {
+            "showTime": true,
+            "wrapLogMessage": true,
+            "sortOrder": "Descending"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "{namespace=\"cloud-sec\"}"
+            }
+          ]
+        }
       ]
     }

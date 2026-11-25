@@ -53,6 +53,14 @@ data "kubernetes_service" "grafana" {
   depends_on = [helm_release.kube_prometheus_stack]
 }
 
+data "kubernetes_service" "prometheus" {
+  metadata {
+    name      = "monitoring-kube-prometheus-prometheus"
+    namespace = "monitoring"
+  }
+  depends_on = [helm_release.kube_prometheus_stack]
+}
+
 # Root "app-of-apps": ArgoCD tracks gitops/argocd in this repo, which in turn defines
 # one Application per microservice (gitops/services/*) plus ingress/HPAs.
 resource "helm_release" "argocd_root" {
@@ -100,6 +108,12 @@ resource "helm_release" "kube_prometheus_stack" {
 
   values = [yamlencode({
     prometheus = {
+      # Public UI on port 9090 for the demo. Prometheus has no login, so
+      # prometheus_allowed_cidrs can narrow who may reach it.
+      service = {
+        type                     = "LoadBalancer"
+        loadBalancerSourceRanges = var.prometheus_allowed_cidrs
+      }
       prometheusSpec = {
         # Scrape every ServiceMonitor/PodMonitor in any namespace (our apps expose /metrics).
         serviceMonitorSelectorNilUsesHelmValues = false

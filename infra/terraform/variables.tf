@@ -101,6 +101,12 @@ variable "argocd_admin_password" {
   default     = "change-me-argocd"
 }
 
+variable "prometheus_allowed_cidrs" {
+  description = "Source ranges allowed to reach the public Prometheus UI (it has no login). Default: anyone."
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
 variable "grafana_admin_password" {
   type      = string
   sensitive = true

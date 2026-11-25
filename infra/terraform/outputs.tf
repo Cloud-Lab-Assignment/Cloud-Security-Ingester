@@ -50,10 +50,11 @@ output "flink_submit_command" {
 }
 
 output "load_balancer_ips" {
-  description = "Public IPs of the argocd / grafana Services (log-ingestion and the query API appear in the ArgoCD UI)"
+  description = "Public IPs of the argocd / grafana / prometheus (port 9090) Services (log-ingestion and the query API appear in the ArgoCD UI)"
   value = {
-    argocd  = try(data.kubernetes_service.argocd.status[0].load_balancer[0].ingress[0].ip, "pending - re-run terraform apply")
-    grafana = try(data.kubernetes_service.grafana.status[0].load_balancer[0].ingress[0].ip, "pending - re-run terraform apply")
+    argocd     = try(data.kubernetes_service.argocd.status[0].load_balancer[0].ingress[0].ip, "pending - re-run terraform apply")
+    grafana    = try(data.kubernetes_service.grafana.status[0].load_balancer[0].ingress[0].ip, "pending - re-run terraform apply")
+    prometheus = try("${data.kubernetes_service.prometheus.status[0].load_balancer[0].ingress[0].ip}:9090", "pending - re-run terraform apply")
   }
 }
 

@@ -57,3 +57,5 @@ Full steps, ports and settings: [docs/handoff.md, "Local run (fresh clone)"](doc
 - [Review fixes, round 1](docs/review-fixes-2026-11-16.md): done (P2-2 left as a known limit).
 - [Review fixes, round 2](docs/review-fixes-round2-2026-11-16.md): done.
 - [Review fixes, round 3](docs/review-fixes-round3-2026-11-16.md): done. This was the last code round; the code is frozen for the demo, the viva and the group-repo PR.
+
+Small change to see if argocd catches it.
