@@ -9,4 +9,4 @@ images:
   # CI (.github/workflows/ci.yml) bumps newTag in a Git commit -> ArgoCD syncs.
   # PROJECT_ID is replaced by scripts/set-registry.sh.
   - name: asia-south1-docker.pkg.dev/project-01b2c261-3004-404e-9a0/cloud-sec/investigation-query-api
-    newTag: 4d6b015
+    newTag: 2c31a75
